@@ -33,6 +33,8 @@ Ni uses `~/.pi/agent` by default. Pass `--agent-dir` to use a separate configura
 - **Sessions.** Resume or fork Pi v3 JSONL sessions, navigate conversation branches, compact history, and export HTML, Markdown, or JSONL.
 - **Headless modes.** `--print` prints the final reply, `--mode json` streams JSONL events, and `--mode rpc` accepts JSONL commands on stdin. During model streaming, RPC clients can inspect state, steer, queue follow-ups, or abort. Other commands wait for the prompt to finish.
 
+RPC clients can use `get_entries` with an optional `since` entry ID to read session history in append order. `get_tree` returns nested branches and their labels. `get_fork_messages` lists the text prompts available for forking.
+
 ## Tests
 
 ```sh

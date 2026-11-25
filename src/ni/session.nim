@@ -12,6 +12,7 @@ type
     sekThinkingChange = "thinking_level_change"
     sekCompaction = "compaction"
     sekSessionInfo = "session_info"
+    sekLabel = "label"
 
   SessionEntry* = object
     id*: string
@@ -31,6 +32,9 @@ type
       tokensBefore*: int
     of sekSessionInfo:
       name*: string
+    of sekLabel:
+      targetId*: string
+      label*: Option[string]
 
   SessionSummaryInfo* = object
     id*: string
@@ -107,7 +111,8 @@ proc resolveSessionsRoot*(cfg: ConfigBundle, cliSessionDir = ""): string =
     return cfg.settings.sessionDir
   cfg.agentDir / "sessions"
 
-proc entryToJson(e: SessionEntry): JsonNode =
+proc entryToJson*(e: SessionEntry): JsonNode =
+  ## Serialize a session entry in the JSONL format shared with Pi.
   result = %*{
     "type": $e.kind,
     "id": e.id,
@@ -128,6 +133,10 @@ proc entryToJson(e: SessionEntry): JsonNode =
     result["tokensBefore"] = %e.tokensBefore
   of sekSessionInfo:
     result["name"] = %e.name
+  of sekLabel:
+    result["targetId"] = %e.targetId
+    if e.label.isSome:
+      result["label"] = %e.label.get
 
 proc parseEntryJson(node: JsonNode): Option[SessionEntry] =
   if node.isNil or node.kind != JObject:
@@ -170,6 +179,13 @@ proc parseEntryJson(node: JsonNode): Option[SessionEntry] =
     some(SessionEntry(
       id: id, parentId: pid, timestamp: ts, kind: sekSessionInfo,
       name: node{"name"}.getStr("")
+    ))
+  of "label":
+    let label = node{"label"}
+    some(SessionEntry(
+      id: id, parentId: pid, timestamp: ts, kind: sekLabel,
+      targetId: node{"targetId"}.getStr(""),
+      label: (if not label.isNil and label.kind == JString: some(label.getStr()) else: none(string))
     ))
   else:
     none(SessionEntry)
@@ -547,7 +563,7 @@ type
     isCurrentLeaf*: bool
 
 proc buildSessionTreeItems*(sm: SessionManager): seq[SessionTreeItem] =
-  ## Flatten the session entry tree in DFS chronological order for `/tree` navigation and RPC `get_tree`.
+  ## Flatten the session entry tree in DFS chronological order for `/tree` navigation.
   if sm.entries.len == 0:
     return @[]
 
@@ -593,6 +609,8 @@ proc buildSessionTreeItems*(sm: SessionManager): seq[SessionTreeItem] =
       ("compaction", $e.tokensBefore & " tokens summarized")
     of sekSessionInfo:
       ("info", e.name)
+    of sekLabel:
+      ("label", e.label.get(""))
 
   proc walk(
     parentId: string,
@@ -622,6 +640,40 @@ proc buildSessionTreeItems*(sm: SessionManager): seq[SessionTreeItem] =
       walk(e.id, depth + branchExtra, entries, childrenByParent, activeIds, leafId, outItems)
 
   walk("", 0, sm.entries, childrenByParent, activeIds, sm.leafId, result)
+
+proc sessionTreeToJson*(sm: SessionManager): JsonNode =
+  ## Serialize every branch with its entries and the latest label for each node.
+  var labels = initTable[string, tuple[text, timestamp: string]]()
+  for e in sm.entries:
+    if e.kind == sekLabel:
+      let label = e.label.get("")
+      if label.len > 0:
+        labels[e.targetId] = (label, e.timestamp)
+      else:
+        labels.del(e.targetId)
+
+  var nodes = newSeqOfCap[JsonNode](sm.entries.len)
+  for e in sm.entries:
+    let node = %*{"entry": entryToJson(e), "children": []}
+    if labels.hasKey(e.id):
+      let label = labels[e.id]
+      node["label"] = %label.text
+      node["labelTimestamp"] = %label.timestamp
+    nodes.add(node)
+
+  result = newJArray()
+  for i, e in sm.entries:
+    let parent = sm.indexById.getOrDefault(e.parentId, -1)
+    if parent < 0 or e.parentId == e.id:
+      result.add(nodes[i])
+    else:
+      nodes[parent]["children"].add(nodes[i])
+
+  for node in nodes:
+    node["children"].elems.sort(proc(a, b: JsonNode): int =
+      # Both Ni and Pi write timestamps in the same UTC ISO format.
+      cmp(a["entry"]["timestamp"].getStr(), b["entry"]["timestamp"].getStr())
+    )
 
 proc forkSessionAtEntry*(sm: SessionManager, targetEntryId: string, sessionsRoot: string): SessionManager =
   ## Fork an open SessionManager from targetEntryId (or current leaf when empty) into a new session file.

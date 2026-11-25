@@ -363,19 +363,40 @@ proc runRpcMode*(rt: AgentRuntime): int =
       rt.session = rt.session.forkSessionAtEntry(entryId, resolveSessionsRoot(rt.cfg))
       writeRpcLine(rpcOk(reqId, cmdType, %*{ "text": "", "cancelled": false, "sessionId": rt.session.id }))
 
-    of "get_tree":
-      var tArr = newJArray()
-      for item in rt.session.buildSessionTreeItems():
-        tArr.add(%*{
-          "id": item.entryId,
-          "parentId": (if item.parentId.len > 0: %item.parentId else: newJNull()),
-          "depth": item.depth,
-          "role": item.roleLabel,
-          "preview": item.preview,
-          "isActivePath": item.isActivePath,
-          "isCurrentLeaf": item.isCurrentLeaf
-        })
-      writeRpcLine(rpcOk(reqId, "get_tree", %*{ "tree": tArr, "leafId": rt.session.leafId }))
+    of "get_fork_messages":
+      let messages = newJArray()
+      for entry in rt.session.entries:
+        if entry.kind == sekMessage and entry.message.role == mrUser:
+          var text = ""
+          for blockItem in entry.message.userBlocks:
+            if blockItem.kind == ckText:
+              text.add(blockItem.text)
+          if text.len > 0:
+            messages.add(%*{"entryId": entry.id, "text": text})
+      writeRpcLine(rpcOk(reqId, cmdType, %*{"messages": messages}))
+
+    of "get_entries", "get_tree":
+      let session = rt.session
+      let leafId = if session.leafId.len > 0: %session.leafId else: newJNull()
+      if cmdType == "get_tree":
+        writeRpcLine(rpcOk(reqId, cmdType, %*{"tree": session.sessionTreeToJson(), "leafId": leafId}))
+      else:
+        var first = 0
+        if cmdNode.hasKey("since"):
+          let since = cmdNode["since"]
+          if since.kind != JString:
+            writeRpcLine(rpcErr(reqId, cmdType, "`since` must be an entry ID string"))
+            continue
+          let entryId = since.getStr()
+          let index = session.indexById.getOrDefault(entryId, -1)
+          if index < 0:
+            writeRpcLine(rpcErr(reqId, cmdType, "Entry not found: " & entryId))
+            continue
+          first = index + 1
+        let entries = newJArray()
+        for i in first ..< session.entries.len:
+          entries.add(entryToJson(session.entries[i]))
+        writeRpcLine(rpcOk(reqId, cmdType, %*{"entries": entries, "leafId": leafId}))
 
     of "get_messages":
       let (msgs, _, _) = rt.session.buildActiveContext()

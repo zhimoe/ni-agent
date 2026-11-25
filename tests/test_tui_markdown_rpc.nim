@@ -520,6 +520,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       let rpcInput = [
         """{"id":"1","type":"get_state"}""",
         """{"id":"2","type":"get_commands"}""",
+        """{"id":"empty","type":"get_entries"}""",
         """{"id":"3","type":"prompt","message":"/pingtpl Alice"}""",
         """{"id":"4","type":"get_last_assistant_text"}""",
         """{"id":"5","type":"get_tree"}"""
@@ -534,6 +535,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
 
       var sawState = false
       var sawPromptCmd = false
+      var sawEmpty = false
       var sawAgentEnd = false
       var sawLastText = false
       var sawTree = false
@@ -547,17 +549,24 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
         elif j{"id"}.getStr("") == "2" and j{"success"}.getBool():
           if "pingtpl" in $j["data"]["commands"]:
             sawPromptCmd = true
+        elif j{"id"}.getStr("") == "empty" and j{"success"}.getBool():
+          check j["data"] == %*{"entries": [], "leafId": nil}
+          sawEmpty = true
         elif j{"type"}.getStr("") == "agent_end":
           sawAgentEnd = true
         elif j{"id"}.getStr("") == "4" and j{"success"}.getBool():
           check j["data"]["text"].getStr() == "RPC_REPLY:Say pong to Alice"
           sawLastText = true
         elif j{"id"}.getStr("") == "5" and j{"success"}.getBool():
-          check j["data"]["tree"].len >= 2
+          let tree = j["data"]["tree"]
+          check tree.len == 1
+          check tree[0]["entry"]["message"]["role"].getStr() == "user"
+          check tree[0]["children"][0]["entry"]["id"] == j["data"]["leafId"]
           sawTree = true
 
       check sawState
       check sawPromptCmd
+      check sawEmpty
       check sawAgentEnd
       check sawLastText
       check sawTree
@@ -611,3 +620,70 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       check responses["clear"]["data"]["followUp"] == %*["next question"]
       check responses["abort"]["success"].getBool()
       check endedAt >= 0 and abortAt > endedAt
+
+  test "RPC reads Pi session branches, labels, and append-order cursors":
+    let niBin = getCurrentDir() / addFileExt("ni", ExeExt)
+    require fileExists(niBin)
+    let root = getTempDir() / ("ni_rpc_history_" & $nowUnixMs())
+    createDir(root / "agent")
+    defer: removeDir(root)
+
+    let sessionFile = root / "history.jsonl"
+    writeFile(sessionFile, """
+{"type":"session","version":3,"id":"history","timestamp":"2026-01-01T00:00:00.000Z"}
+{"type":"message","id":"first","parentId":null,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"First question","timestamp":0}}
+{"type":"message","id":"image","parentId":"first","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"user","content":[{"type":"image","data":"AA==","mimeType":"image/png"}],"timestamp":0}}
+{"type":"message","id":"older","parentId":"first","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"Second "},{"type":"text","text":"question"}],"timestamp":0}}
+{"type":"label","id":"marked","parentId":"older","timestamp":"2026-01-01T00:00:03.000Z","targetId":"older","label":"Start here"}
+{"type":"label","id":"temporary","parentId":"marked","timestamp":"2026-01-01T00:00:04.000Z","targetId":"first","label":"Temporary"}
+{"type":"label","id":"cleared","parentId":"temporary","timestamp":"2026-01-01T00:00:05.000Z","targetId":"first"}
+{"type":"session_info","id":"orphan","parentId":"missing","timestamp":"2026-01-01T00:00:06.000Z","name":"Imported"}
+""")
+    let rpc = startProcess(niBin, workingDir = root, args = @[
+      "--mode", "rpc", "--no-mcp", "--session", sessionFile, "--agent-dir", root / "agent"
+    ], options = {poUsePath})
+    defer: rpc.close()
+    rpc.inputStream.writeLine("""{"id":"all","type":"get_entries"}""")
+    rpc.inputStream.writeLine("""{"id":"next","type":"get_entries","since":"older"}""")
+    rpc.inputStream.writeLine("""{"id":"end","type":"get_entries","since":"orphan"}""")
+    rpc.inputStream.writeLine("""{"id":"missing","type":"get_entries","since":"missing"}""")
+    rpc.inputStream.writeLine("""{"id":"fork","type":"get_fork_messages"}""")
+    rpc.inputStream.writeLine("""{"id":"tree","type":"get_tree"}""")
+    rpc.inputStream.close()
+
+    var responses = initTable[string, JsonNode]()
+    for line in rpc.outputStream.readAll().strip().splitLines():
+      let response = parseJson(line)
+      responses[response["id"].getStr()] = response
+    check rpc.waitForExit() == 0
+    require responses.len == 6
+
+    let all = responses["all"]["data"]
+    check all["leafId"] == %"orphan"
+    var entryIds: seq[string]
+    for e in all["entries"]:
+      entryIds.add(e["id"].getStr())
+    check entryIds == @["first", "image", "older", "marked", "temporary", "cleared", "orphan"]
+    check all["entries"][0]["parentId"].kind == JNull
+    check responses["next"]["data"]["entries"].elems == all["entries"].elems[3 .. ^1]
+    check responses["end"]["data"] == %*{"entries": [], "leafId": "orphan"}
+    check not responses["missing"]["success"].getBool()
+    check responses["missing"]["error"] == %"Entry not found: missing"
+    check responses["fork"]["data"]["messages"] == %*[
+      {"entryId": "first", "text": "First question"},
+      {"entryId": "older", "text": "Second question"}
+    ]
+
+    let tree = responses["tree"]["data"]["tree"]
+    require tree.len == 2
+    check responses["tree"]["data"]["leafId"] == %"orphan"
+    check tree[1]["entry"] == all["entries"][6]
+    check tree[0]["entry"] == all["entries"][0]
+    check not tree[0].hasKey("label")
+    check not tree[0].hasKey("labelTimestamp")
+    let children = tree[0]["children"]
+    require children.len == 2
+    check children[0]["entry"] == all["entries"][2]
+    check children[0]["label"] == %"Start here"
+    check children[0]["labelTimestamp"] == %"2026-01-01T00:00:03.000Z"
+    check children[1]["entry"] == all["entries"][1]
