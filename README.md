@@ -22,16 +22,7 @@ Ni uses `~/.pi/agent` by default. Pass `--agent-dir` to use a separate configura
 
 ### Windows
 
-In PowerShell, build with `nim c -d:release -o:ni.exe src/ni.nim` and run `.\ni.exe` in Windows Terminal or the Windows console. Ni reads Unicode console input directly, including when prompts use Chinese or other non-ASCII text.
-
-Place a PEM CA bundle named `cacert.pem` and the matching OpenSSL 3 DLLs beside `ni.exe`. The default filenames match Git for Windows.
-
-| Architecture | OpenSSL DLLs |
-| --- | --- |
-| x64 | `libssl-3-x64.dll`, `libcrypto-3-x64.dll` |
-| ARM64 | `libssl-3.dll`, `libcrypto-3.dll` |
-
-Use `-d:sslVersion` to select another DLL suffix when compiling. Git for Windows supplies Bash for Bash commands.
+从 `dist/windows` 选择 `x64` 或 `arm64`，复制完整目录到 Windows，再从该目录运行 `.\ni.exe`。重新编译和打包见 [Windows 使用与打包说明](docs/windows.md)。
 
 ## Features
 
