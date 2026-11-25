@@ -1,7 +1,34 @@
 # Headless JSONL RPC mode (`ni --mode rpc`) compatible with Pi's stdin/stdout embedding protocol.
 
-import std/[json, options, strutils, tables]
+import std/[deques, json, options, strutils, tables]
 import ./[types, config, provider, tools, skills, session, agent, tui]
+
+type
+  RpcInputKind = enum
+    rikLine
+    rikEof
+
+  RpcInput = object
+    case kind: RpcInputKind
+    of rikLine: line: string
+    of rikEof: discard
+
+  RpcCommand = object
+    kind: string
+    id: JsonNode
+    payload: JsonNode
+
+proc readRpcInput(input: ptr Channel[RpcInput]) {.thread.} =
+  # The reader only transfers lines. The agent thread owns JSON parsing, state changes, and stdout.
+  try:
+    var line = ""
+    while stdin.readLine(line):
+      if line.len > 0:
+        input[].send(RpcInput(kind: rikLine, line: line))
+  except IOError:
+    discard
+  finally:
+    input[].send(RpcInput(kind: rikEof))
 
 proc writeRpcLine(node: JsonNode) =
   stdout.writeLine($node)
@@ -54,8 +81,8 @@ proc buildRpcStateJson(rt: AgentRuntime, isStreaming = false, isCompacting = fal
     "thinkingLevel": $rt.thinkingLevel,
     "isStreaming": isStreaming,
     "isCompacting": isCompacting,
-    "steeringMode": "one-at-a-time",
-    "followUpMode": "one-at-a-time",
+    "steeringMode": $rt.steeringMode,
+    "followUpMode": $rt.followUpMode,
     "sessionId": rt.session.id,
     "autoCompactionEnabled": rt.cfg.settings.compaction.enabled,
     "messageCount": msgs.len,
@@ -66,118 +93,178 @@ proc buildRpcStateJson(rt: AgentRuntime, isStreaming = false, isCompacting = fal
   if rt.session.displayName.len > 0:
     result["sessionName"] = %rt.session.displayName
 
-proc buildRpcAskQuestionBridge(): AskQuestionCallback =
-  ## Bridge `ask_question` tool calls over RPC `extension_ui_request` / `extension_ui_response` messages.
-  result = proc(questions: seq[AskQuestionItem]): seq[AskQuestionAnswer] =
-    for q in questions:
-      let reqUuid = "rpc_ui_" & genShortId()
-      var optsArr = newJArray()
-      for opt in q.options:
-        optsArr.add(%opt.label)
-      writeRpcLine(%*{
-        "type": "extension_ui_request",
-        "id": reqUuid,
-        "method": "select",
-        "title": q.question,
-        "options": optsArr
-      })
-      var rawLine = ""
-      var answered = false
-      while stdin.readLine(rawLine):
-        let trimmed = rawLine.strip()
-        if trimmed.len == 0:
-          continue
-        let j = try: parseJson(trimmed) except CatchableError: nil
-        if not j.isNil and j.kind == JObject and j{"type"}.getStr("") == "extension_ui_response" and
-           j{"id"}.getStr("") == reqUuid:
-          let cancelled = j{"cancelled"}.getBool(false)
-          let val = j{"value"}.getStr("")
-          result.add(AskQuestionAnswer(
-            id: q.id,
-            question: q.question,
-            selected: (if not cancelled and val.len > 0: @[val] else: @[]),
-            customText: val,
-            cancelled: cancelled
-          ))
-          answered = true
-          break
-      if not answered:
-        result.add(AskQuestionAnswer(id: q.id, question: q.question, cancelled: true))
-        break
+proc readPrompt(payload: JsonNode): QueuedPrompt =
+  result.text = payload{"message"}.getStr("")
+  let images = payload{"images"}
+  if not images.isNil and images.kind == JArray:
+    for img in images:
+      let data = img{"data"}.getStr("")
+      if data.len > 0:
+        result.images.add(imageBlock(data, img{"mimeType"}.getStr("image/png")))
 
 proc runRpcMode*(rt: AgentRuntime): int =
-  ## Listen for JSONL RPC commands on stdin and emit responses + streaming events as JSONL on stdout.
-  if rt.askQuestion.isNil:
-    rt.askQuestion = buildRpcAskQuestionBridge()
-
+  ## Dispatch JSONL commands and poll prompt controls while the model or a dialog is waiting.
+  var input: Channel[RpcInput]
+  input.open(64)
+  var reader: Thread[ptr Channel[RpcInput]]
+  createThread(reader, readRpcInput, addr input)
+  var inputClosed = false
+  var deferred = initDeque[RpcCommand]()
   var currentAbort: AbortFlag = nil
-  var line = ""
+  var abortRequests: seq[JsonNode] = @[]
 
-  while stdin.readLine(line):
-    let trimmed = line.strip()
+  proc decodeCommand(message: RpcInput): Option[RpcCommand] =
+    if message.kind == rikEof:
+      inputClosed = true
+      return none(RpcCommand)
+    let trimmed = message.line.strip()
     if trimmed.len == 0:
-      continue
+      return none(RpcCommand)
 
     let cmdNode = try: parseJson(trimmed) except CatchableError as e:
       writeRpcLine(rpcErr(nil, "parse", "Invalid JSON command: " & e.msg))
-      continue
+      return none(RpcCommand)
 
     if cmdNode.kind != JObject:
       writeRpcLine(rpcErr(nil, "parse", "RPC command must be a JSON object"))
-      continue
+      return none(RpcCommand)
 
-    let reqId = if cmdNode.hasKey("id"): cmdNode["id"] else: nil
+    let reqId = cmdNode{"id"}
     let cmdType = cmdNode{"type"}.getStr("")
     if cmdType.len == 0:
       writeRpcLine(rpcErr(reqId, "unknown", "Missing `type` field on RPC command"))
-      continue
+      return none(RpcCommand)
+    some(RpcCommand(kind: cmdType, id: reqId, payload: cmdNode))
 
-    case cmdType
+  proc handlePromptControl(cmd: RpcCommand): bool =
+    let active = not currentAbort.isNil
+    case cmd.kind
     of "get_state":
-      writeRpcLine(rpcOk(reqId, "get_state", buildRpcStateJson(rt)))
-
-    of "prompt":
-      let message = cmdNode{"message"}.getStr("")
-      var extraImgs: seq[ContentBlock] = @[]
-      if cmdNode.hasKey("images") and cmdNode["images"].kind == JArray:
-        for imgNode in cmdNode["images"].items:
-          if imgNode.kind == JObject:
-            let d = imgNode{"data"}.getStr("")
-            let mime = imgNode{"mimeType"}.getStr("image/png")
-            if d.len > 0:
-              extraImgs.add(imageBlock(d, mime))
-
-      writeRpcLine(rpcOk(reqId, "prompt", %*{ "disposition": "started" }))
-
-      currentAbort = newAbortFlag()
-      discard rt.runPrompt(message, onEvent = emitAgentEventJson, abort = currentAbort, extraImages = extraImgs)
-      currentAbort = nil
-
-    of "steer":
-      let msg = cmdNode{"message"}.getStr("")
-      if msg.len > 0:
-        rt.steeringQueue.add(msg)
-      writeRpcLine(rpcOk(reqId, "steer", %*{ "disposition": "queued" }))
-
-    of "follow_up":
-      let msg = cmdNode{"message"}.getStr("")
-      if msg.len > 0:
-        rt.followUpQueue.add(msg)
-      writeRpcLine(rpcOk(reqId, "follow_up", %*{ "disposition": "queued" }))
-
+      writeRpcLine(rpcOk(cmd.id, cmd.kind, buildRpcStateJson(rt, isStreaming = active)))
+    of "prompt", "steer", "follow_up":
+      if cmd.kind == "prompt" and not active:
+        return false
+      let behavior = case cmd.kind
+        of "steer": "steer"
+        of "follow_up": "followUp"
+        else: cmd.payload{"streamingBehavior"}.getStr("")
+      if behavior notin ["steer", "followUp"]:
+        writeRpcLine(rpcErr(cmd.id, cmd.kind, "A prompt is running. Use streamingBehavior steer or followUp."))
+      else:
+        let prompt = readPrompt(cmd.payload)
+        if prompt.text.strip().len == 0 and prompt.images.len == 0:
+          writeRpcLine(rpcErr(cmd.id, cmd.kind, "Provide a message or image"))
+        else:
+          if behavior == "steer":
+            rt.steeringQueue.add(prompt)
+          else:
+            rt.followUpQueue.add(prompt)
+          writeRpcLine(rpcOk(cmd.id, cmd.kind, %*{ "disposition": "queued" }))
     of "clear_queue":
-      var sArr = newJArray()
-      for s in rt.steeringQueue: sArr.add(%s)
-      var fArr = newJArray()
-      for f in rt.followUpQueue: fArr.add(%f)
+      var steering = newJArray()
+      for prompt in rt.steeringQueue: steering.add(%prompt.text)
+      var followUp = newJArray()
+      for prompt in rt.followUpQueue: followUp.add(%prompt.text)
       rt.steeringQueue.setLen(0)
       rt.followUpQueue.setLen(0)
-      writeRpcLine(rpcOk(reqId, "clear_queue", %*{ "steering": sArr, "followUp": fArr }))
-
+      writeRpcLine(rpcOk(cmd.id, cmd.kind, %*{ "steering": steering, "followUp": followUp }))
     of "abort":
-      if not currentAbort.isNil:
+      if active:
         currentAbort.aborted = true
-      writeRpcLine(rpcOk(reqId, "abort"))
+        abortRequests.add(cmd.id)
+      else:
+        writeRpcLine(rpcOk(cmd.id, cmd.kind))
+    of "set_steering_mode", "set_follow_up_mode":
+      let mode = cmd.payload{"mode"}.getStr("")
+      if mode notin [$qmOneAtATime, $qmAll]:
+        writeRpcLine(rpcErr(cmd.id, cmd.kind, "Queue mode must be all or one-at-a-time"))
+      else:
+        let selected = if mode == $qmAll: qmAll else: qmOneAtATime
+        if cmd.kind == "set_steering_mode": rt.steeringMode = selected
+        else: rt.followUpMode = selected
+        writeRpcLine(rpcOk(cmd.id, cmd.kind))
+    of "extension_ui_response":
+      discard
+    else:
+      return false
+    true
+
+  proc drainActiveInput() =
+    while not inputClosed:
+      let (available, message) = input.tryRecv()
+      if not available:
+        break
+      let parsed = decodeCommand(message)
+      if parsed.isSome and not handlePromptControl(parsed.get):
+        deferred.addLast(parsed.get)
+
+  proc askOverRpc(questions: seq[AskQuestionItem]): seq[AskQuestionAnswer] =
+    for q in questions:
+      let reqUuid = "rpc_ui_" & genShortId()
+      var opts = newJArray()
+      for opt in q.options: opts.add(%opt.label)
+      writeRpcLine(%*{
+        "type": "extension_ui_request", "id": reqUuid, "method": "select",
+        "title": q.question, "options": opts
+      })
+      var answer = AskQuestionAnswer(id: q.id, question: q.question, cancelled: true)
+      while not inputClosed and (currentAbort.isNil or not currentAbort.aborted):
+        let parsed = decodeCommand(input.recv())
+        if parsed.isNone:
+          continue
+        let cmd = parsed.get
+        if cmd.kind == "extension_ui_response" and cmd.id.getStr("") == reqUuid:
+          answer.cancelled = cmd.payload{"cancelled"}.getBool(false)
+          let value = cmd.payload{"value"}.getStr("")
+          if not answer.cancelled and value.len > 0:
+            answer.selected = @[value]
+            answer.customText = value
+          break
+        if not handlePromptControl(cmd):
+          deferred.addLast(cmd)
+      result.add(answer)
+      if answer.cancelled:
+        break
+
+  let originalAsk = rt.askQuestion
+  if originalAsk.isNil:
+    rt.askQuestion = askOverRpc
+  defer:
+    rt.askQuestion = originalAsk
+
+  while deferred.len > 0 or not inputClosed:
+    let parsed = if deferred.len > 0: some(deferred.popFirst()) else: decodeCommand(input.recv())
+    if parsed.isNone:
+      continue
+    let command = parsed.get
+    if handlePromptControl(command):
+      continue
+    let reqId = command.id
+    let cmdType = command.kind
+    let cmdNode = command.payload
+
+    case cmdType
+    of "prompt":
+      let prompt = readPrompt(cmdNode)
+      if prompt.text.strip().len == 0 and prompt.images.len == 0:
+        writeRpcLine(rpcErr(reqId, cmdType, "Provide a message or image"))
+        continue
+      currentAbort = newAbortFlag()
+      let previousTick = rt.providerRegistry.onIdleTick
+      rt.providerRegistry.onIdleTick = drainActiveInput
+      defer:
+        rt.providerRegistry.onIdleTick = previousTick
+        currentAbort = nil
+      writeRpcLine(rpcOk(reqId, cmdType, %*{ "disposition": "started" }))
+      discard rt.runPrompt(prompt.text, abort = currentAbort, extraImages = prompt.images,
+        onEvent = proc(ev: AgentEvent) =
+          emitAgentEventJson(ev)
+          if ev.kind notin {aekToolStart, aekRunEnd}:
+            drainActiveInput()
+      )
+      for id in abortRequests:
+        writeRpcLine(rpcOk(id, "abort"))
+      abortRequests.setLen(0)
 
     of "set_model":
       let prov = cmdNode{"provider"}.getStr("")
@@ -216,12 +303,6 @@ proc runRpcMode*(rt: AgentRuntime): int =
       for lv in supportedThinkingLevels(rt.currentModel):
         lArr.add(%($lv))
       writeRpcLine(rpcOk(reqId, "get_available_thinking_levels", %*{ "levels": lArr }))
-
-    of "set_steering_mode":
-      writeRpcLine(rpcOk(reqId, "set_steering_mode"))
-
-    of "set_follow_up_mode":
-      writeRpcLine(rpcOk(reqId, "set_follow_up_mode"))
 
     of "compact":
       let beforeMsgs = rt.session.activeBranchEntries().len
@@ -359,4 +440,6 @@ proc runRpcMode*(rt: AgentRuntime): int =
     else:
       writeRpcLine(rpcErr(reqId, cmdType, "Unsupported RPC command: " & cmdType))
 
+  joinThread(reader)
+  input.close()
   0

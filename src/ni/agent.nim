@@ -41,6 +41,14 @@ type
 
   AgentEventCallback* = proc(ev: AgentEvent) {.closure.}
 
+  QueueMode* = enum
+    qmOneAtATime = "one-at-a-time"
+    qmAll = "all"
+
+  QueuedPrompt* = object
+    text*: string
+    images*: seq[ContentBlock]
+
   AgentRuntime* = ref object
     cfg*: ConfigBundle
     providerRegistry*: ProviderRegistry
@@ -55,8 +63,10 @@ type
     cliApiKey*: string
     cliAppendPrompts*: seq[string]
     askQuestion*: AskQuestionCallback
-    steeringQueue*: seq[string]
-    followUpQueue*: seq[string]
+    steeringQueue*: seq[QueuedPrompt]
+    followUpQueue*: seq[QueuedPrompt]
+    steeringMode*: QueueMode
+    followUpMode*: QueueMode
     lastAssistantText*: string
     lastDiff*: string
 
@@ -323,6 +333,19 @@ proc switchThinkingLevel*(rt: AgentRuntime, level: ThinkingLevel) =
   rt.thinkingLevel = level
   rt.session.appendThinkingChange(level)
 
+proc appendQueuedPrompts(rt: AgentRuntime, queue: var seq[QueuedPrompt], mode: QueueMode): bool =
+  if queue.len == 0:
+    return false
+  let count = if mode == qmAll: queue.len else: 1
+  for i in 0 ..< count:
+    let prompt = queue[i]
+    discard rt.session.appendMessage(rt.buildUserPromptMessage(prompt.text, extraImages = prompt.images))
+  if mode == qmAll:
+    queue.setLen(0)
+  else:
+    queue.delete(0)
+  true
+
 proc runPrompt*(
   rt: AgentRuntime,
   rawPrompt: string,
@@ -363,6 +386,9 @@ proc runPrompt*(
 
     if not onEvent.isNil:
       onEvent(AgentEvent(kind: aekTurnStart, turnIndex: turns, modelId: rt.currentModel.id))
+    if turnAbort.aborted:
+      lastAssistant.stopReason = srAborted
+      break
 
     let assistantMsg = rt.providerRegistry.streamCompletion(
       cfg = rt.cfg,
@@ -395,15 +421,11 @@ proc runPrompt*(
 
     let toolCalls = collectToolCalls(assistantMsg.assistantBlocks)
     if toolCalls.len == 0:
-      if rt.steeringQueue.len > 0:
-        let nextSteer = rt.steeringQueue[0]
-        rt.steeringQueue.delete(0)
-        discard rt.session.appendMessage(rt.buildUserPromptMessage(nextSteer))
-        continue
-      if rt.followUpQueue.len > 0:
-        let nextFollow = rt.followUpQueue[0]
-        rt.followUpQueue.delete(0)
-        discard rt.session.appendMessage(rt.buildUserPromptMessage(nextFollow))
+      if turnAbort.aborted:
+        lastAssistant.stopReason = srAborted
+        break
+      if rt.appendQueuedPrompts(rt.steeringQueue, rt.steeringMode) or
+          rt.appendQueuedPrompts(rt.followUpQueue, rt.followUpMode):
         continue
       break
 
@@ -435,10 +457,8 @@ proc runPrompt*(
 
       discard rt.session.appendMessage(newToolResultMessage(tc.id, tc.name, outp))
 
-    if rt.steeringQueue.len > 0:
-      let nextSteer = rt.steeringQueue[0]
-      rt.steeringQueue.delete(0)
-      discard rt.session.appendMessage(newUserMessage(nextSteer))
+    if not turnAbort.aborted:
+      discard rt.appendQueuedPrompts(rt.steeringQueue, rt.steeringMode)
 
   if not onEvent.isNil:
     onEvent(AgentEvent(kind: aekRunEnd, finalMessage: lastAssistant, totalTurns: turns))

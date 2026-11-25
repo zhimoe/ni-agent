@@ -40,7 +40,7 @@ Use `-d:sslVersion` to select another DLL suffix when compiling. Git for Windows
 - **Workspace tools.** Read, write, edit, run shell commands, search and list files, ask questions, and discover deferred tools. Fuzzy edits preserve the original BOM and line endings. Use `/copy` to copy a reply, code block, or diff.
 - **Configuration.** Reuse Pi settings, models, credentials, project trust, skills, and prompt templates. Ni supports stdio and Streamable HTTP MCP servers and manages them with `ni mcp list`, `add`, and `remove`.
 - **Sessions.** Resume or fork Pi v3 JSONL sessions, navigate conversation branches, compact history, and export HTML, Markdown, or JSONL.
-- **Headless modes.** `--print` prints the final reply, `--mode json` streams JSONL events, and `--mode rpc` accepts JSONL commands on stdin. RPC processes commands serially, so steering and abort commands wait for the active prompt to finish.
+- **Headless modes.** `--print` prints the final reply, `--mode json` streams JSONL events, and `--mode rpc` accepts JSONL commands on stdin. During model streaming, RPC clients can inspect state, steer, queue follow-ups, or abort. Other commands wait for the prompt to finish.
 
 ## Tests
 

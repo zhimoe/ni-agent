@@ -110,6 +110,49 @@ suite "Provider SSE Streaming, Session Tree, and Multi-turn Agent Loop":
     let (branchedMsgs, _, _) = reloaded.buildActiveContext()
     check branchedMsgs.len == 1
 
+  test "Steering batches attachments and file references before one-at-a-time follow-ups":
+    let tmp = getTempDir() / ("ni_queue_" & $nowUnixMs())
+    createDir(tmp)
+    defer: removeDir(tmp)
+    writeFile(tmp / "notes.txt", "queue context")
+
+    var requests: seq[JsonNode]
+    let transport: HttpStreamTransport = proc(
+      url, httpMethod: string,
+      headers: Table[string, string],
+      body, proxyUrl: string,
+      timeoutMs: int,
+      abort: AbortFlag,
+      onLine: HttpLineChunkCallback
+    ): HttpStreamResponse =
+      requests.add(parseJson(body)["messages"])
+      onLine("""data: {"choices":[{"delta":{"content":"Received"},"finish_reason":"stop"}]}""")
+      HttpStreamResponse(statusCode: 200)
+
+    let cfg = loadConfigBundle(tmp, tmp / "agent")
+    let registry = newProviderRegistry(cfg, transport)
+    let (model, _) = registry.resolveModel(cfg, "deepseek/deepseek-chat", cliApiKey = "test-key")
+    let rt = newAgentRuntime(
+      cfg, registry, newToolRegistry(@[]),
+      McpManager(servers: initOrderedTable[string, McpServerSession]()), @[],
+      newSecurityPolicy(tmp, cfg.agentDir), newSessionManager(tmp, tmp / "sessions", persist = false),
+      model, tlOff, cliApiKey = "test-key"
+    )
+    rt.steeringMode = qmAll
+    rt.steeringQueue = @[
+      QueuedPrompt(text: "steer with image", images: @[imageBlock("AQID", "image/png")]),
+      QueuedPrompt(text: "check @notes.txt")
+    ]
+    rt.followUpQueue = @[QueuedPrompt(text: "first follow-up"), QueuedPrompt(text: "second follow-up")]
+
+    discard rt.runPrompt("Start")
+    require requests.len == 4
+    let steerMessages = requests[1]
+    check steerMessages[steerMessages.len - 2]["content"][1]["image_url"]["url"].getStr() == "data:image/png;base64,AQID"
+    check "queue context" in steerMessages[steerMessages.len - 1]["content"].getStr()
+    check requests[2][requests[2].len - 1]["content"].getStr() == "first follow-up"
+    check requests[3][requests[3].len - 1]["content"].getStr() == "second follow-up"
+
   test "OpenAI Responses (/v1/responses) SSE streaming adapter":
     let tmp = getTempDir() / ("ni_resp_" & $nowUnixMs())
     createDir(tmp)

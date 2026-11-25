@@ -157,8 +157,8 @@ proc buildEditorStatus*(rt: AgentRuntime, gitBranch: string, workingStatus = "")
               (rt.cfg.auth.hasKey(rt.currentModel.provider) and rt.cfg.auth[rt.currentModel.provider].kind == ckOAuth)
 
   var queued: seq[string] = @[]
-  for s in rt.steeringQueue: queued.add(s)
-  for f in rt.followUpQueue: queued.add(f)
+  for prompt in rt.steeringQueue: queued.add(prompt.text)
+  for prompt in rt.followUpQueue: queued.add(prompt.text)
 
   EditorStatusInfo(
     cwd: rt.cfg.cwd,
@@ -975,9 +975,9 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
         let outOpt = vp.ed.handleKeyEvent(inputKey)
         if outOpt.isSome and outOpt.get.kind == eokSubmit and outOpt.get.text.strip().len > 0:
           if followUp:
-            rt.followUpQueue.add(outOpt.get.text)
+            rt.followUpQueue.add(QueuedPrompt(text: outOpt.get.text))
           else:
-            rt.steeringQueue.add(outOpt.get.text)
+            rt.steeringQueue.add(QueuedPrompt(text: outOpt.get.text))
       vp.redrawDock()
 
     let nowMs = nowUnixMs()

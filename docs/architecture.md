@@ -8,6 +8,8 @@ The agent expands file references, skills, and prompt templates. It combines the
 
 The terminal interface renders stream events above the editor. Completed Markdown blocks are written to scrollback. The current draft and the unfinished response are redrawn as they change. On resize, the terminal history is rebuilt from the current Ni transcript.
 
+RPC reads stdin on a dedicated thread. The agent thread processes prompt controls while waiting for provider data or a dialog response. Commands that change the session run after the active prompt settles.
+
 ## Modules
 
 | File | Responsibility |

@@ -449,7 +449,8 @@ All args: $@""")
       let portFile = root / "rpc_port.txt"
       let srvPy = root / "rpc_mock_llm.py"
       writeFile(srvPy, """
-import http.server, json, socketserver, sys
+import http.server, json, socketserver, sys, time
+from pathlib import Path
 
 port_file = sys.argv[1]
 
@@ -463,6 +464,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for m in body.get("messages", []):
             if m.get("role") == "user":
                 user_txt = str(m.get("content", ""))
+        if user_txt == "hold-for-abort":
+            Path(port_file + ".active").touch()
+            time.sleep(3)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -557,3 +561,53 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       check sawAgentEnd
       check sawLastText
       check sawTree
+
+      let liveRpc = startProcess(
+        niBin,
+        workingDir = ws,
+        args = @["--mode", "rpc", "--no-session", "--no-mcp", "--model", "rpcmock/rpc-model", "--agent-dir", agentDir],
+        options = {poUsePath}
+      )
+      defer:
+        try: liveRpc.close() except CatchableError: discard
+
+      liveRpc.inputStream.writeLine("""{"id":"start","type":"prompt","message":"hold-for-abort"}""")
+      liveRpc.inputStream.flush()
+      for _ in 0 ..< 100:
+        if fileExists(portFile & ".active"): break
+        sleep(20)
+      check fileExists(portFile & ".active")
+
+      liveRpc.inputStream.write([
+        """{"id":"mode","type":"set_steering_mode","mode":"all"}""",
+        """{"id":"steer","type":"steer","message":"change direction"}""",
+        """{"id":"follow","type":"prompt","streamingBehavior":"followUp","message":"next question"}""",
+        """{"id":"active","type":"get_state"}""",
+        """{"id":"clear","type":"clear_queue"}""",
+        """{"id":"abort","type":"abort"}"""
+      ].join("\n") & "\n")
+      liveRpc.inputStream.close()
+      let events = liveRpc.outputStream.readAll().strip().splitLines()
+      check liveRpc.waitForExit() == 0
+
+      var responses = initTable[string, JsonNode]()
+      var endedAt = -1
+      var abortAt = -1
+      for i, line in events:
+        let event = parseJson(line)
+        if event{"type"}.getStr() == "agent_end":
+          endedAt = i
+          check event["stopReason"].getStr() == "aborted"
+        let id = event{"id"}.getStr()
+        if id.len > 0:
+          responses[id] = event
+          if id == "abort": abortAt = i
+
+      require responses.hasKey("active") and responses.hasKey("clear") and responses.hasKey("abort")
+      check responses["active"]["data"]["isStreaming"].getBool()
+      check responses["active"]["data"]["pendingMessageCount"].getInt() == 2
+      check responses["active"]["data"]["steeringMode"].getStr() == "all"
+      check responses["clear"]["data"]["steering"] == %*["change direction"]
+      check responses["clear"]["data"]["followUp"] == %*["next question"]
+      check responses["abort"]["success"].getBool()
+      check endedAt >= 0 and abortAt > endedAt
