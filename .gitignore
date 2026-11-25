@@ -1,0 +1,9 @@
+/ni
+/ni.exe
+/bin/
+/dist/
+/nimcache/
+tests/test_*
+!tests/test_*.nim
+*.dSYM/
+.DS_Store
