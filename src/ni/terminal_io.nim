@@ -18,6 +18,9 @@ type
     kkDelete
     kkPageUp
     kkPageDown
+    kkScrollUp
+    kkScrollDown
+    kkMouseOther
     kkWordLeft
     kkWordRight
     kkEnter
@@ -84,6 +87,41 @@ proc isInteractiveTerminal*(): bool =
 proc isStdoutTty*(): bool =
   ## Return true when stdout is attached to a TTY.
   stdout.isatty()
+
+var fullScreenActive = false
+
+proc supportsFullScreen*(): bool =
+  ## Return true when the terminal can host the fixed-layout alternate screen (interactive, non-dumb).
+  if not isInteractiveTerminal():
+    return false
+  let term = getEnv("TERM").toLowerAscii()
+  term.len > 0 and term != "dumb"
+
+proc fullScreenEnabled*(): bool =
+  ## Return true while the alternate screen buffer is active.
+  fullScreenActive
+
+proc enterFullScreen*() =
+  ## Enter the alternate screen buffer, hide the cursor, and capture wheel events for in-app scrolling.
+  if fullScreenActive or not supportsFullScreen():
+    return
+  stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[?1000h\x1b[?1006h\x1b[?25l")
+  stdout.flushFile()
+  fullScreenActive = true
+
+proc exitFullScreen*() =
+  ## Leave the alternate screen buffer, release mouse capture, and restore the cursor.
+  if not fullScreenActive:
+    return
+  stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l")
+  stdout.flushFile()
+  fullScreenActive = false
+
+proc clearFullScreen*() =
+  ## Erase the whole alternate screen and home the cursor (used before modal widgets).
+  if fullScreenActive:
+    stdout.write("\x1b[2J\x1b[H")
+    stdout.flushFile()
 
 proc colorsActive*(): bool =
   ## Return true when ANSI styling sequences should be emitted.
@@ -467,9 +505,20 @@ proc normalizePastedText(raw: string): string =
 proc decodeCsiSequence(paramsStr: string, finalCh: char): KeyEvent =
   case finalCh
   of 'A':
+    if paramsStr in ["1;2", "2"]:
+      return KeyEvent(kind: kkScrollUp)
     return KeyEvent(kind: kkUp)
   of 'B':
+    if paramsStr in ["1;2", "2"]:
+      return KeyEvent(kind: kkScrollDown)
     return KeyEvent(kind: kkDown)
+  of 'M', 'm':
+    # SGR mouse tracking (`\x1b[<b;x;yM`): only wheel events scroll the transcript.
+    if paramsStr.len > 1 and paramsStr[0] == '<':
+      let code = (try: parseInt(paramsStr[1 .. ^1].split(';')[0]) except ValueError: -1)
+      if finalCh == 'M' and code >= 0 and (code and 64) != 0:
+        return KeyEvent(kind: (if (code and 1) == 0: kkScrollUp else: kkScrollDown))
+    return KeyEvent(kind: kkMouseOther)
   of 'C':
     if paramsStr in ["1;3", "1;5", "3", "5"]:
       return KeyEvent(kind: kkWordRight)

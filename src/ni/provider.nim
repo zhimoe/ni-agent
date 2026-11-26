@@ -1,7 +1,7 @@
 # Extensible LLM provider registry and real-time SSE streaming adapters (OpenAI, DeepSeek, and OpenAI-compatible endpoints).
 
 import std/[asyncdispatch, httpclient, json, net, options, os, strutils, tables, uri]
-import ./[types, config]
+import ./[types, config, utf8]
 
 type
   ToolSchemaDef* = object
@@ -460,6 +460,11 @@ proc parseToolArgumentsJson(raw: string): JsonNode =
   except CatchableError:
     return %*{ "_raw": raw }
 
+proc encodeProviderBody(body: JsonNode): string =
+  # Nim's JSON serializer emits string bytes verbatim after escaping JSON syntax.
+  # Tool output and old session entries can contain malformed UTF-8.
+  replaceInvalidUtf8($body)
+
 proc formatHttpError(providerId: string, status: int, body: string): string =
   var detail = body.strip()
   try:
@@ -473,7 +478,7 @@ proc formatHttpError(providerId: string, status: int, body: string): string =
   except CatchableError:
     discard
   if detail.len > 600:
-    detail = detail[0 ..< 600] & "..."
+    detail = detail[0 ..< utf8BoundaryBefore(detail, 600)] & "..."
   "Provider '" & providerId & "' HTTP " & $status & ": " & detail
 
 proc openAICompletionsAdapter*(
@@ -588,7 +593,7 @@ proc openAICompletionsAdapter*(
   var httpResp: HttpStreamResponse
   try:
     httpResp = transport(
-      url, "POST", headers, $bodyJson, req.proxyUrl, req.timeoutMs, abort,
+      url, "POST", headers, encodeProviderBody(bodyJson), req.proxyUrl, req.timeoutMs, abort,
       proc(line: string) =
         let trimmed = line.strip()
         if trimmed.len == 0 or trimmed.startsWith(":"):
@@ -805,7 +810,7 @@ proc openAIResponsesAdapter*(
   var httpResp: HttpStreamResponse
   try:
     httpResp = transport(
-      url, "POST", headers, $bodyJson, req.proxyUrl, req.timeoutMs, abort,
+      url, "POST", headers, encodeProviderBody(bodyJson), req.proxyUrl, req.timeoutMs, abort,
       proc(line: string) =
         if not line.startsWith("data:"):
           return
@@ -1194,7 +1199,7 @@ proc anthropicMessagesAdapter*(
   var httpResp: HttpStreamResponse
   try:
     httpResp = transport(
-      url, "POST", headers, $bodyJson, req.proxyUrl, req.timeoutMs, abort,
+      url, "POST", headers, encodeProviderBody(bodyJson), req.proxyUrl, req.timeoutMs, abort,
       proc(line: string) =
         if not line.startsWith("data:"):
           return
@@ -1558,7 +1563,7 @@ proc googleGenerativeAIAdapter*(
   var httpResp: HttpStreamResponse
   try:
     httpResp = transport(
-      url, "POST", headers, $bodyJson, req.proxyUrl, req.timeoutMs, abort,
+      url, "POST", headers, encodeProviderBody(bodyJson), req.proxyUrl, req.timeoutMs, abort,
       proc(line: string) =
         if not line.startsWith("data:"):
           return

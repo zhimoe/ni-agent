@@ -1,7 +1,7 @@
 # Core multi-turn Agent runtime: @file expansion, context compaction, streaming LLM turns, and tool execution loop.
 
 import std/[base64, json, options, os, strutils]
-import ./[types, config, trust, provider, tools, skills, mcp, session, prompt]
+import ./[types, config, trust, provider, tools, skills, mcp, session, prompt, utf8]
 
 const MaxAgentTurnsPerRun* = 64
 
@@ -193,7 +193,7 @@ proc renderTranscriptForSummary(entries: openArray[SessionEntry]): string =
     of mrToolResult:
       var r = collectText(m.resultBlocks)
       if r.len > 2000:
-        r = r[0 ..< 2000] & "\n...[truncated for summary]"
+        r = r[0 ..< utf8BoundaryBefore(r, 2000)] & "\n...[truncated for summary]"
       parts.add("[ToolResult " & m.toolName & (if m.isError: " ERROR" else: "") & "]\n" & r)
     of mrSystem:
       discard

@@ -5,7 +5,7 @@ when defined(windows):
   import std/winlean
 else:
   import std/posix
-import ./[types, config, trust, provider]
+import ./[types, config, trust, provider, utf8]
 
 const
   DefaultMaxLines* = 2000
@@ -222,9 +222,8 @@ proc truncateHead*(text: string, maxLines = DefaultMaxLines, maxBytes = DefaultM
     let addBytes = line.len + (if outLines.len > 0: 1 else: 0)
     if usedBytes + addBytes > maxBytes:
       if outLines.len == 0:
-        let sliceLen = min(line.len, maxBytes)
+        let sliceLen = utf8BoundaryBefore(line, maxBytes)
         outLines.add(line[0 ..< sliceLen])
-        usedBytes = sliceLen
       break
     outLines.add(line)
     usedBytes += addBytes
@@ -836,7 +835,7 @@ proc execFindTool(args: JsonNode, ctx: ToolContext): ToolOutput =
 
 proc clipGrepLine(s: string): string =
   if s.len <= GrepMaxLineChars: s
-  else: s[0 ..< GrepMaxLineChars] & "...[truncated]"
+  else: s[0 ..< utf8BoundaryBefore(s, GrepMaxLineChars)] & "...[truncated]"
 
 proc execGrepPureNim(
   pattern, searchPath, globPat: string,

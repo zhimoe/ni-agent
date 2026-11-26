@@ -110,6 +110,63 @@ suite "Provider SSE Streaming, Session Tree, and Multi-turn Agent Loop":
     let (branchedMsgs, _, _) = reloaded.buildActiveContext()
     check branchedMsgs.len == 1
 
+  test "DeepSeek replays tool output containing malformed UTF-8 from a saved session":
+    let tmp = getTempDir() / ("ni_utf8_" & $nowUnixMs())
+    createDir(tmp)
+    defer: removeDir(tmp)
+
+    let sess = newSessionManager(tmp, tmp / "sessions", persist = true)
+    discard sess.appendMessage(newUserMessage("检查输出 😀"))
+    discard sess.appendMessage(AgentMessage(role: mrAssistant, assistantBlocks: @[
+      toolCallBlock("call_utf8", "bash", %*{"command": "echo test"})
+    ]))
+    # A clipped CJK character and byte sequences encoding invalid Unicode scalar values.
+    let legacyOutput = "中文\xE4\xB8\n\xED\xA0\x80|\xF4\x90\x80\x80|\xE0\x80\x80 😀"
+    let validOutput = "中文�\n���|����|��� 😀"
+    discard sess.appendMessage(AgentMessage(role: mrToolResult, toolCallId: "call_utf8",
+      toolName: "bash", resultBlocks: @[textBlock(legacyOutput)]))
+    let repairedJsonLine = readFile(sess.filePath).strip().splitLines()[^1]
+    check parseJson(repairedJsonLine)["message"]["content"][0]["text"].getStr() == validOutput
+
+    # Simulate a session written by an older version that emitted the raw bytes.
+    let saved = readFile(sess.filePath)
+    let legacyJsonl = saved.replace(escapeJson(validOutput), escapeJson(legacyOutput))
+    require legacyJsonl != saved
+    writeFile(sess.filePath, legacyJsonl)
+    let (messages, _, _) = loadSessionFile(sess.filePath).buildActiveContext()
+    require messages.len == 3
+    check collectText(messages[^1].resultBlocks) == validOutput
+    check readFile(sess.filePath) == legacyJsonl
+
+    let transport: HttpStreamTransport = proc(
+      url, httpMethod: string, headers: Table[string, string], body, proxyUrl: string,
+      timeoutMs: int, abort: AbortFlag, onLine: HttpLineChunkCallback
+    ): HttpStreamResponse =
+      let payload = parseJson(body)["messages"]
+      check payload[0]["content"].getStr() == "检查输出 😀"
+      check payload[2]["tool_call_id"].getStr() == "call_utf8"
+      check payload[2]["content"].getStr() == validOutput
+      onLine("""data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}""")
+      HttpStreamResponse(statusCode: 200)
+
+    let cfg = loadConfigBundle(tmp, tmp / "agent")
+    let registry = newProviderRegistry(cfg, transport)
+    let (model, _) = registry.resolveModel(cfg, "deepseek/deepseek-chat", cliApiKey = "test-key")
+    let reply = registry.streamCompletion(cfg = cfg, model = model, systemPrompt = "",
+      messages = messages, tools = @[], thinkingLevel = tlOff, cliApiKey = "test-key")
+    check reply.stopReason == srStop
+    check collectText(reply.assistantBlocks) == "OK"
+
+    let (liveMessages, _, _) = sess.buildActiveContext()
+    check collectText(liveMessages[^1].resultBlocks) == legacyOutput
+    let liveReply = registry.streamCompletion(cfg = cfg, model = model, systemPrompt = "",
+      messages = liveMessages, tools = @[], thinkingLevel = tlOff, cliApiKey = "test-key")
+    check liveReply.stopReason == srStop
+    let exported = sess.exportSessionToFile(tmp / "export.jsonl")
+    let (exportedMessages, _, _) = loadSessionFile(exported).buildActiveContext()
+    require exportedMessages.len == 3
+    check escapeJson(validOutput) in readFile(exported)
+
   test "Steering batches attachments and file references before one-at-a-time follow-ups":
     let tmp = getTempDir() / ("ni_queue_" & $nowUnixMs())
     createDir(tmp)

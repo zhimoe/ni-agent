@@ -1,7 +1,7 @@
 # Pi v3 compatible JSONL tree session manager (persistence, branching, resume, fork, and compaction).
 
 import std/[algorithm, json, options, os, random, strutils, tables, times]
-import ./[types, config]
+import ./[types, config, utf8]
 
 const SessionFormatVersion* = 3
 
@@ -203,7 +203,7 @@ proc writeHeaderIfNeeded(sm: SessionManager) =
   }
   if sm.parentSessionPath.len > 0:
     hdr["parentSession"] = %sm.parentSessionPath
-  writeFile(sm.filePath, $hdr & "\n")
+  writeFile(sm.filePath, replaceInvalidUtf8($hdr) & "\n")
 
 proc appendRawEntry(sm: SessionManager, entry: SessionEntry) =
   var e = entry
@@ -227,7 +227,7 @@ proc appendRawEntry(sm: SessionManager, entry: SessionEntry) =
     sm.writeHeaderIfNeeded()
     let f = open(sm.filePath, fmAppend)
     defer: f.close()
-    f.writeLine($entryToJson(e))
+    f.writeLine(replaceInvalidUtf8($entryToJson(e)))
 
 proc newSessionManager*(
   cwd: string,
@@ -268,7 +268,8 @@ proc newSessionManager*(
 
 proc loadSessionFile*(path: string, persist = true): SessionManager =
   ## Load an existing Pi v3 JSONL session file and reconstruct its tree and leaf state.
-  let raw = stripUtf8Bom(readFile(path))
+  # Older versions could write raw bytes from files or command output into JSONL.
+  let raw = replaceInvalidUtf8(stripUtf8Bom(readFile(path)))
   let lines = raw.replace("\r\n", "\n").split('\n')
 
   result = SessionManager(
@@ -443,7 +444,7 @@ proc summarizeSessionFile(path: string): Option[SessionSummaryInfo] =
     return none(SessionSummaryInfo)
   try:
     let mtime = getLastModificationTime(path)
-    let raw = stripUtf8Bom(readFile(path))
+    let raw = replaceInvalidUtf8(stripUtf8Bom(readFile(path)))
     var sid = extractFilename(path)
     var cwd = ""
     var ts = ""
@@ -787,7 +788,7 @@ proc exportSessionHtml*(sm: SessionManager): string =
         inner.add("<pre>" & escapeHtml(txt) & "</pre>")
       for tc in collectToolCalls(m.assistantBlocks):
         let aStr = if tc.arguments.isNil: "{}" else: $tc.arguments
-        inner.add("<div class=\"tool-call\">⚙ <code>" & escapeHtml(tc.name) & "</code> <span>" & escapeHtml(aStr) & "</span></div>")
+        inner.add("<div class=\"tool-call\">● <code>" & escapeHtml(tc.name) & "</code> <span>" & escapeHtml(aStr) & "</span></div>")
       bodyParts.add("<div class=\"card assistant\">" & inner & "</div>")
     of mrToolResult:
       let cls = if m.isError: "tool-result error" else: "tool-result"
@@ -851,7 +852,7 @@ proc exportSessionToFile*(sm: SessionManager, rawTarget = ""): string =
     lines.add($hdr)
     for e in sm.activeBranchEntries():
       lines.add($entryToJson(e))
-    writeFile(outPath, lines.join("\n") & "\n")
+    writeFile(outPath, replaceInvalidUtf8(lines.join("\n")) & "\n")
   else:
     writeFile(outPath, exportSessionHtml(sm))
   outPath

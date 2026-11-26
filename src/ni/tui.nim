@@ -1,21 +1,22 @@
 # Interactive Docked TUI (persistent bottom input bar, live status border, searchable /model selector, streaming Markdown), print & JSONL modes.
 
 import std/[algorithm, json, options, os, sets, strutils, tables]
-import ./[types, config, trust, provider, tools, skills, mcp, session, prompt, agent, brand, terminal_io, keybindings, editor, markdown]
+import ./[types, config, trust, provider, tools, skills, mcp, session, prompt, agent, brand, terminal_io, keybindings, editor, markdown, viewport]
 
 type
   DockViewport* = ref object
     rt*: AgentRuntime
     ed*: InputEditor
+    transcript*: Transcript
     followUpKeys: set[KeyKind]
     gitBranch*: string
     workingPhase: string
     workingDetail: string
-    transcriptLines: seq[string]
     activeTailLines*: seq[string]
     drawnFrame: seq[string]
     drawnSize: tuple[cols: int, rows: int]
     suspended*: bool
+    fullScreen*: bool
     turnStartMs: int64
 
   ModelPickResult = object
@@ -34,6 +35,7 @@ proc installCtrlCHandler() =
     else:
       inc sigintCount
       if sigintCount >= 2:
+        exitFullScreen()
         exitRawTerminalMode()
         quit(130)
   )
@@ -181,12 +183,14 @@ proc newDockViewport*(rt: AgentRuntime, ed: InputEditor): DockViewport =
   DockViewport(
     rt: rt,
     ed: ed,
+    transcript: newTranscript(),
     followUpKeys: loadFollowUpKeys(rt.cfg.agentDir),
-    gitBranch: detectGitBranch(rt.cfg.cwd)
+    gitBranch: detectGitBranch(rt.cfg.cwd),
+    fullScreen: supportsFullScreen()
   )
 
 proc isDockedActive(vp: DockViewport): bool =
-  not vp.isNil and isInteractiveTerminal() and not vp.suspended
+  not vp.isNil and vp.fullScreen and not vp.suspended
 
 proc setWorkingStatus(vp: DockViewport, phase = "", detail = "") =
   vp.workingPhase = phase
@@ -215,110 +219,111 @@ proc formatWorkingStatus(vp: DockViewport): string =
   styleCyan(spinner & " " & vp.workingPhase) & styleDim(" " & minutes & ":" & seconds & "s" &
     (if vp.workingDetail.len > 0: " · " & vp.workingDetail else: ""))
 
-proc updateDockRows(output: var string, previous, next: openArray[string], rows: int) =
-  let start = output.len
-  for offset in countdown(max(previous.len, next.len), 1):
-    let oldLine = if offset <= previous.len: previous[previous.len - offset] else: ""
-    let newLine = if offset <= next.len: next[next.len - offset] else: ""
-    if oldLine != newLine:
-      if output.len == start:
-        output.add("\x1b7") # The transcript cursor stays at its append position.
-      output.add("\x1b[" & $(rows - offset + 1) & ";1H" & newLine & "\x1b[K")
-  if output.len > start:
-    output.add("\x1b8")
+proc paintScreen(vp: DockViewport, forceRepaint = false) =
+  ## Compose and paint one full frame: scrollable transcript above, input box + status line pinned to the bottom.
+  if vp.isNil or not vp.isDockedActive():
+    return
+  let (cols, rows) = terminalSize()
+  var full = forceRepaint or cols != vp.drawnSize.cols or rows != vp.drawnSize.rows
+  if full:
+    vp.drawnFrame.setLen(0)
+  vp.transcript.setTail(vp.activeTailLines)
+  let status = buildEditorStatus(vp.rt, vp.gitBranch, vp.formatWorkingStatus())
+  let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows)
+  var output = ""
+  if full and vp.drawnSize.cols > 0:
+    output.add("\x1b[2J")
+  output.add(paintDiff(vp.drawnFrame, frame, fullRepaint = full))
+  if output.len > 0:
+    beginSyncOutput()
+    stdout.write(output)
+    endSyncOutput()
+  vp.drawnFrame = frame
+  vp.drawnSize = (cols, rows)
 
 proc redrawDock*(vp: DockViewport, commitLinesFirst: openArray[string] = []) =
-  ## Atomically write any permanent scrollback lines, redraw the active streaming Markdown tail, and re-anchor the bottom input dock.
+  ## Commit permanent transcript rows, then repaint the docked input bar and status line.
   if vp.isNil:
     return
-  if not vp.isDockedActive():
+  if not vp.fullScreen:
     for cl in commitLinesFirst:
       stdout.writeLine(cl)
     if commitLinesFirst.len > 0:
       stdout.flushFile()
     return
-
-  let size = terminalSize()
-  let (cols, rows) = size
-  # Leave the last column free so painting the bottom row cannot trigger terminal auto-wrap.
-  let width = cols - 1
-  let status = buildEditorStatus(vp.rt, vp.gitBranch, vp.formatWorkingStatus())
-  let dockLines = renderEditorFrame(vp.ed, status, width, rows - 2)
-  # The Markdown renderer owns scrollback commits. A taller editor can temporarily hide part of its tail.
-  let tailCount = min(vp.activeTailLines.len, rows - dockLines.len - 1)
-
-  for line in commitLinesFirst:
-    vp.transcriptLines.add(line)
-  var frame = newSeqOfCap[string](tailCount + dockLines.len)
-  for i in (vp.activeTailLines.len - tailCount) ..< vp.activeTailLines.len:
-    frame.add(truncateVisible(vp.activeTailLines[i], width))
-  for line in dockLines:
-    frame.add(truncateVisible(line, width, ellipsis = ""))
-
-  var output = ""
-  if vp.drawnSize.cols > 0 and size != vp.drawnSize:
-    # The terminal may already have moved preview rows into scrollback during the resize.
-    output.add("\x1b[2J\x1b[H\x1b[3J")
-    vp.drawnFrame.setLen(0)
-    for line in vp.transcriptLines:
-      output.add(line & "\r\n")
-  elif commitLinesFirst.len > 0 or frame.len > vp.drawnFrame.len:
-    # Erase the old frame before transcript output can scroll it into the history.
-    output.updateDockRows(vp.drawnFrame, [], rows)
-    vp.drawnFrame.setLen(0)
-    for line in commitLinesFirst:
-      output.add(line & "\r\n")
-
-  if vp.drawnFrame.len == 0:
-    # Reserve space beneath the transcript cursor. These line feeds scroll only when needed.
-    output.add("\r\n".repeat(frame.len) & "\x1b[" & $frame.len & "A")
-  output.updateDockRows(vp.drawnFrame, frame, rows)
-  vp.drawnFrame = frame
-  vp.drawnSize = size
-  if output.len > 0:
-    beginSyncOutput()
-    stdout.write(output)
-    endSyncOutput()
+  vp.transcript.addLines(commitLinesFirst)
+  if vp.isDockedActive():
+    vp.paintScreen()
 
 proc suspendDock*(vp: DockViewport) =
-  ## Temporarily clear the docked input box so a modal selector (`/model`, `ask_question`, `/login`) can render cleanly.
+  ## Clear the fixed layout so a modal selector (`/model`, `ask_question`, `/login`) can render from the top.
   if vp.isNil or vp.suspended:
     return
   if vp.isDockedActive():
-    if vp.drawnSize.cols > 0 and vp.drawnSize != terminalSize():
-      vp.redrawDock()
-    var output = ""
-    output.updateDockRows(vp.drawnFrame, [], vp.drawnSize.rows)
-    vp.drawnFrame.setLen(0)
-    if output.len > 0:
-      beginSyncOutput()
-      stdout.write(output)
-      endSyncOutput()
+    clearFullScreen()
+  vp.drawnFrame.setLen(0)
   vp.suspended = true
 
 proc resumeDock*(vp: DockViewport) =
-  ## Re-anchor the docked input box at the bottom of the screen after a modal closes.
+  ## Re-anchor the transcript viewport and the docked input box after a modal closes.
   if vp.isNil:
     return
   vp.suspended = false
   vp.gitBranch = detectGitBranch(vp.rt.cfg.cwd)
+  vp.drawnFrame.setLen(0)
   vp.redrawDock()
 
+proc applyScrollKey*(vp: DockViewport, ev: KeyEvent): bool =
+  ## Handle transcript scrolling keys; returns true when the key was consumed.
+  if vp.isNil or not vp.fullScreen or vp.suspended:
+    return false
+  let (_, rows) = terminalSize()
+  let page = max(1, rows - 8)
+  case ev.kind
+  of kkPageUp:
+    vp.transcript.scrollBy(page)
+  of kkPageDown:
+    vp.transcript.scrollBy(-page)
+  of kkScrollUp:
+    vp.transcript.scrollBy(3)
+  of kkScrollDown:
+    vp.transcript.scrollBy(-3)
+  of kkHome:
+    if vp.transcript.atBottom(): return false
+    vp.transcript.scrollToTop()
+  of kkEnd:
+    if vp.transcript.atBottom(): return false
+    vp.transcript.scrollToBottom()
+  else:
+    return false
+  true
+
 proc handleDockKey(vp: DockViewport, ev: KeyEvent): Option[EditorOutcome] =
-  if ev.kind == kkCtrlL and colorsActive():
+  if vp.applyScrollKey(ev):
+    return none(EditorOutcome)
+  if ev.kind == kkCtrlL:
     vp.drawnFrame.setLen(0)
   vp.ed.handleKeyEvent(ev)
 
+proc printAboveDock*(vp: DockViewport, lines: openArray[string]) =
+  ## Commit one or more rendered rows into the transcript as a notice block.
+  if vp.isNil:
+    return
+  if vp.fullScreen:
+    discard vp.transcript.beginSegment(segNotice)
+    vp.transcript.addLines(lines)
+    if vp.isDockedActive():
+      vp.paintScreen()
+    return
+  for line in lines:
+    stdout.writeLine(line)
+  stdout.flushFile()
+
 proc printAboveDock*(vp: DockViewport, text: string) =
-  ## Commit one or more lines permanently into the transcript above the docked input bar.
-  let clean = text.replace("\r\n", "\n")
-  let lines = clean.split('\n')
-  if vp.isDockedActive():
-    vp.redrawDock(lines)
-  else:
-    for l in lines:
-      stdout.writeLine(l)
-    stdout.flushFile()
+  ## Commit a multi-line message permanently into the transcript above the docked input bar.
+  if vp.isNil:
+    return
+  vp.printAboveDock(text.replace("\r\n", "\n").split('\n'))
 
 proc renderUserPromptBlock*(displayText: string, cols: int): seq[string] =
   ## Format a submitted user prompt with a subtle left accent bar so user turns stand out clearly in scrollback.
@@ -332,6 +337,21 @@ proc renderUserPromptBlock*(displayText: string, cols: int): seq[string] =
     for wl in wrapAnsiText(styled, max(24, cols - 2), firstIndent = firstPfx, contIndent = contPfx):
       result.add(wl)
   result.add("")
+
+proc promptTitle(displayText: string): string =
+  ## First meaningful prompt line, used for the pinned transcript header.
+  for line in displayText.replace("\r\n", "\n").split('\n'):
+    let trimmed = line.strip()
+    if trimmed.len > 0:
+      return truncateVisible(trimmed, 64, ellipsis = "…")
+  ""
+
+proc beginUserTurn*(vp: DockViewport, displayText: string, cols: int) =
+  ## Start a new user message block in the transcript and render its prompt rows.
+  if vp.isNil:
+    return
+  discard vp.transcript.beginSegment(segUser, promptTitle(displayText))
+  vp.redrawDock(renderUserPromptBlock(displayText, cols))
 
 # Diff & tool call formatting
 
@@ -423,7 +443,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
       of aekToolStart:
         if inText: mdStream.finishStream(); inText = false
         let argSummary = summarizeToolArgs(ev.toolName, ev.toolArgs)
-        stdout.writeLine(styleCyan("⚙ " & ev.toolName) & (if argSummary.len > 0: " " & styleDim(argSummary) else: ""))
+        stdout.writeLine(styleCyan("● " & ev.toolName) & (if argSummary.len > 0: " " & styleDim(argSummary) else: ""))
       of aekToolEnd:
         if ev.toolOutput.isError:
           stdout.writeLine("  " & styleRed("✗ " & collectText(ev.toolOutput.content).splitLines()[0]))
@@ -443,6 +463,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
     if thinkingBuf.strip().len > 0 and not hideThinking:
       let (cols, _) = terminalSize()
       vp.activeTailLines.setLen(0)
+      discard vp.transcript.beginSegment(segThinking)
       vp.redrawDock(renderThinkingLines(thinkingBuf, cols) & @[""])
     thinkingBuf = ""
 
@@ -488,6 +509,8 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
       of sekTextDelta:
         if thinkingBuf.len > 0:
           flushThinkingAboveDock()
+        if not inText:
+          discard vp.transcript.beginSegment(segAssistant, vp.rt.currentModel.id)
         inText = true
         vp.setWorkingStatus("Generating")
         let (committed, activeTail) = mdStream.stepStreamMarkdown(sev.textDelta, maxErasable)
@@ -507,6 +530,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
         if inText:
           flushTextAboveDock()
         vp.activeTailLines.setLen(0)
+        discard vp.transcript.beginSegment(segNotice)
         vp.redrawDock(@["  " & styleRed("✗ " & sev.errorMsg), ""])
 
       else:
@@ -518,8 +542,9 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
       if inText:
         flushTextAboveDock()
       let argSummary = summarizeToolArgs(ev.toolName, ev.toolArgs)
-      let toolLine = "  " & styleCyan("⚙ " & ev.toolName) & (if argSummary.len > 0: " " & styleDim(argSummary) else: "")
+      let toolLine = "  " & styleCyan("● " & ev.toolName) & (if argSummary.len > 0: " " & styleDim(argSummary) else: "")
       vp.setWorkingStatus("Running " & ev.toolName, argSummary)
+      discard vp.transcript.beginSegment(segTool, ev.toolName & (if argSummary.len > 0: " " & argSummary else: ""))
       vp.redrawDock(@[toolLine])
 
     of aekToolEnd:
@@ -537,6 +562,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
         vp.redrawDock(commit)
 
     of aekCompaction:
+      discard vp.transcript.beginSegment(segNotice)
       vp.redrawDock(@["  " & styleMagenta("⟳ Auto-compacted conversation (" & $ev.tokensBefore & " est. tokens summarized)")])
 
     of aekTurnEnd:
@@ -838,6 +864,8 @@ proc hotkeysMarkdown(): string =
 | `Alt+B` / `Alt+F` · `Ctrl+A` / `Ctrl+E` | Jump by word or start/end of line |
 | `Ctrl+U` / `Ctrl+K` / `Ctrl+W` / `Ctrl+Y` | Kill line/word into kill-ring & yank |
 | `Ctrl+_` / `Ctrl+Z` · `Ctrl+G` | Undo edit or open `$VISUAL` / `$EDITOR` |
+| `PgUp` / `PgDn` · wheel | Scroll transcript history (input box stays pinned at the bottom) |
+| `Shift+↑` / `Shift+↓` · `Home` / `End` | Scroll one line, jump to the oldest row, or back to the live tail |
 | `Esc` / `Ctrl+C` · `Ctrl+D` | Interrupt active turn, clear input, or exit on empty prompt |
 """
 
@@ -973,7 +1001,7 @@ proc reloadRuntimeResources(rt: AgentRuntime, vp: DockViewport) =
                 $newMcp.servers.len & " MCP server(s)."]
   for d in newCfg.diagnostics & skillDiags & tplDiags & newMcp.diagnostics:
     lines.add("    " & styleYellow("! " & d))
-  vp.redrawDock(lines)
+  vp.printAboveDock(lines)
 
 proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArray[string] = []) =
   ## Run an agent prompt while keeping the bottom input bar docked, animating status, and accepting live Esc / queued follow-ups.
@@ -1081,16 +1109,20 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
   let vp = newDockViewport(rt, ed)
   if interactive:
     enterRawTerminalMode()
+    if vp.fullScreen:
+      enterFullScreen()
   defer:
     if interactive:
       vp.suspendDock()
+      if vp.fullScreen:
+        exitFullScreen()
       exitRawTerminalMode()
 
   vp.redrawDock(banner)
   if initialPrompt.strip().len > 0 or initialFiles.len > 0:
     let (cols, _) = terminalSize()
     if initialPrompt.strip().len > 0:
-      vp.redrawDock(renderUserPromptBlock(initialPrompt, cols))
+      vp.beginUserTurn(initialPrompt, cols)
     else:
       vp.redrawDock()
     runAgentTurnDocked(vp, initialPrompt, initialFiles)
@@ -1113,7 +1145,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
   while true:
     let event = pollRawKeyNonBlocking(100)
     if event.isNone:
-      if terminalSize() != vp.drawnSize:
+      if vp.fullScreen and terminalSize() != vp.drawnSize:
         vp.redrawDock()
       continue
     let ev = event.get
@@ -1161,6 +1193,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       if shCmd.len == 0:
         vp.redrawDock()
         continue
+      discard vp.transcript.beginSegment(segNotice, "$ " & shCmd)
       vp.redrawDock(@["  " & styleCyan("$ " & shCmd)])
       let (exe, baseArgs) = resolveBashShell(rt.cfg.settings.shellPath)
       let runAbort = newAbortFlag()
@@ -1178,7 +1211,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       if res.exitCode != 0:
         outLines.add("  " & styleYellow("[exit code " & $res.exitCode & "]"))
       outLines.add("")
-      vp.redrawDock(outLines)
+      vp.printAboveDock(outLines)
       if not excludeCtx:
         let trunc = truncateHead(res.output.replace("\r\n", "\n"))
         discard rt.session.appendMessage(newUserMessage(
@@ -1190,7 +1223,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
     # 2. Slash commands (except `/skill:<name>` and matching `/<prompt-template>`, which run as agent prompts)
     if trimmed.startsWith("/") and not trimmed.startsWith("/skill:"):
       if expandPromptTemplateCommand(trimmed, rt.promptTemplates).isSome:
-        vp.redrawDock(renderUserPromptBlock(outcome.displayText, cols))
+        vp.beginUserTurn(outcome.displayText, cols)
         runAgentTurnDocked(vp, rawInput)
         continue
 
@@ -1203,9 +1236,9 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         vp.suspendDock()
         break
       of "/help", "/?":
-        vp.redrawDock(indentLines(renderMarkdown(helpMarkdown(), max(36, cols - 4)), "  ") & @[""])
+        vp.printAboveDock(indentLines(renderMarkdown(helpMarkdown(), max(36, cols - 4)), "  ") & @[""])
       of "/hotkeys", "/keys":
-        vp.redrawDock(indentLines(renderMarkdown(hotkeysMarkdown(), max(36, cols - 4)), "  ") & @[""])
+        vp.printAboveDock(indentLines(renderMarkdown(hotkeysMarkdown(), max(36, cols - 4)), "  ") & @[""])
       of "/copy":
         handleCopyCommand(rt, arg, vp)
       of "/model":
@@ -1272,7 +1305,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
             let modeTag = if sk.disableModelInvocation: " [manual /skill:" & sk.name & " only]" else: ""
             lines.add("  • " & styleBold(sk.name) & styleDim(" (" & sk.source & ")" & modeTag) & " — " & sk.description)
           lines.add("")
-          vp.redrawDock(lines)
+          vp.printAboveDock(lines)
       of "/prompts":
         if rt.promptTemplates.len == 0:
           vp.printAboveDock("  " & styleDim("No prompt templates discovered (~/.pi/agent/prompts, .pi/prompts)."))
@@ -1282,7 +1315,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
             let hintStr = if tpl.argumentHint.len > 0: " " & tpl.argumentHint else: ""
             lines.add("  • " & styleBold("/" & tpl.name) & styleCyan(hintStr) & styleDim(" (" & tpl.source & ") — ") & tpl.description)
           lines.add("")
-          vp.redrawDock(lines)
+          vp.printAboveDock(lines)
       of "/mcp":
         if arg.toLowerAscii() == "reconnect":
           reloadRuntimeResources(rt, vp)
@@ -1300,7 +1333,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
             if sess.lastError.len > 0:
               lines.add("    " & styleRed("Error: " & sess.lastError))
           lines.add("")
-          vp.redrawDock(lines)
+          vp.printAboveDock(lines)
       of "/tools":
         if arg.len > 0:
           let parts = arg.split({',', ' '})
@@ -1316,7 +1349,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
           let mark = if tname in rt.toolRegistry.activeNames: styleGreen("●") else: styleDim("○")
           lines.add("  " & mark & " " & styleBold(tname) & styleDim(" (" & $t.exposure & ") — " & t.snippet))
         lines.add("")
-        vp.redrawDock(lines)
+        vp.printAboveDock(lines)
       of "/trust":
         case arg.toLowerAscii()
         of "allow", "true", "yes":
@@ -1334,7 +1367,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
                             " (security mode: " & $rt.security.mode & ")")
       of "/session":
         let u = rt.session.totalUsage
-        vp.redrawDock(@[
+        vp.printAboveDock(@[
           "  Session ID : " & rt.session.id,
           (if rt.session.displayName.len > 0: "  Name       : " & rt.session.displayName else: "  Name       : (untitled)"),
           "  File       : " & (if rt.session.filePath.len > 0: rt.session.filePath else: "(in-memory)"),
@@ -1467,8 +1500,8 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         vp.printAboveDock("  " & styleYellow("Unknown command '" & cmd & "'. Type /help for available commands."))
       continue
 
-    # 3. Normal user message or `/skill:<name>` -> render user block in scrollback + run docked agent turn
-    vp.redrawDock(renderUserPromptBlock(outcome.displayText, cols))
+    # 3. Normal user message or `/skill:<name>` -> render user block in the transcript + run docked agent turn
+    vp.beginUserTurn(outcome.displayText, cols)
     runAgentTurnDocked(vp, rawInput)
 
   0

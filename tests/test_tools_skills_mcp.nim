@@ -69,6 +69,21 @@ suite "Tools, Agent Skills, Live Stdio MCP Server, and Clipboard":
     check bTimeout.isError
     check "timed out" in collectText(bTimeout.content).toLowerAscii()
 
+  test "Tool output byte limits preserve UTF-8 characters at both edges":
+    check truncateHead("ab中😀", maxBytes = 4).content == "ab"
+    check truncateHead("ab中😀", maxBytes = 5).content == "ab中"
+    check truncateHead("ab中😀", maxBytes = 8).content == "ab中"
+
+    let half = McpToolMaxTextBytes div 2
+    let prefix = repeat('a', half - 1)
+    let suffix = repeat('b', half - 1)
+    let raw = prefix & "中hidden😀" & suffix
+    let clipped = middleTruncateMcpText(raw, "utf8-test")
+    require clipped.savedPath.len > 0
+    defer: removeFile(clipped.savedPath)
+    check readFile(clipped.savedPath) == raw
+    check clipped.output.startsWith(prefix & "\n…13 bytes truncated…\n" & suffix & "\n")
+
   test "SKILL.md discovery, validation, <available_skills> XML, and /skill:<name> expansion":
     let root = getTempDir() / ("ni_skills_" & $nowUnixMs())
     let agentDir = root / "agent"

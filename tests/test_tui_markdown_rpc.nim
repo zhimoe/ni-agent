@@ -1,7 +1,7 @@
 # Comprehensive unit & E2E tests for TUI width/wrapping, InputEditor, Markdown/Syntax renderer, Anthropic & Gemini SSE, Prompt Templates, Fuzzy Edit, Session Tree/Export, and `--mode rpc`.
 
 import std/[json, options, os, osproc, streams, strutils, tables, unittest]
-import ../src/ni/[types, config, trust, provider, tools, skills, mcp, session, agent, terminal_io, keybindings, editor, markdown]
+import ../src/ni/[types, config, trust, provider, tools, skills, mcp, session, agent, terminal_io, keybindings, editor, markdown, viewport]
 
 suite "TUI Layout, Multi-line Input Editor, and Terminal Markdown Renderer":
   test "Unicode/CJK visibleWidth, ANSI/OSC8 stripping, and ANSI-preserving word wrap":
@@ -236,6 +236,101 @@ proc greet*(name: string): int =
       if "greet" in rline and "\x1b[" in rline:
         sawHighlightedProc = true
     check sawHighlightedProc
+
+suite "Fixed-layout transcript viewport (pinned dock, scrollback, sticky headers)":
+  test "Transcript pins the owning message header while scrolled":
+    let prevColors = colorsActive()
+    setColorsEnabled(true)
+    defer: setColorsEnabled(prevColors)
+
+    let t = newTranscript()
+    discard t.beginSegment(segNotice, "banner")
+    t.addLines(["banner 1", "banner 2", "banner 3"])
+    discard t.beginSegment(segUser, "first question")
+    for i in 0 ..< 10:
+      t.addLines(["q" & $i])
+    discard t.beginSegment(segAssistant, "model-x")
+    for i in 0 ..< 30:
+      t.addLines(["a" & $i])
+    check t.totalLines() == 43
+
+    # Following the live tail: no pinned header, newest rows visible.
+    check t.atBottom()
+    let bottom = t.renderHistory(60, 10)
+    check bottom.len == 10
+    check "lines above" notin stripAnsi(bottom[0])
+    check "a29" in stripAnsi(bottom[^1])
+
+    # Scrolled into the assistant message: its header is pinned on the first row.
+    t.scrollBy(13)
+    check not t.atBottom()
+    let scrolled = t.renderHistory(60, 10)
+    check scrolled.len == 10
+    check "assistant" in stripAnsi(scrolled[0])
+    check "model-x" in stripAnsi(scrolled[0])
+    check "lines above" in stripAnsi(scrolled[0])
+    check stripAnsi(scrolled[1]).strip().endsWith("a8")
+
+    # Scrolled into the user message: the user header is pinned instead.
+    t.scrollBy(12)
+    let userView = t.renderHistory(60, 10)
+    check "❯ you" in stripAnsi(userView[0])
+    check "first question" in stripAnsi(userView[0])
+    check "assistant" notin stripAnsi(userView[0])
+    check stripAnsi(userView[1]).strip().endsWith("q6")
+
+    # Clamped at both ends and recoverable with End.
+    t.scrollBy(10_000)
+    check t.scrollUp == t.totalLines() - 1
+    t.scrollToBottom()
+    check t.atBottom()
+    check "a29" in stripAnsi(t.renderHistory(60, 10)[^1])
+
+    for row in scrolled:
+      check visibleWidth(row) <= 60
+
+  test "New rows keep a scrolled-up view anchored instead of yanking it to the tail":
+    let t = newTranscript()
+    discard t.beginSegment(segAssistant, "model")
+    for i in 0 ..< 40:
+      t.addLines(["line" & $i])
+    t.scrollBy(20)
+    let before = t.renderHistory(80, 10)
+    t.addLines(["fresh1", "fresh2"])
+    let after = t.renderHistory(80, 10)
+    check before == after
+    t.setTail(["tail1", "tail2"])
+    check t.renderHistory(80, 10) == after
+
+  test "composeScreen pins the input box and status line to the bottom rows":
+    let prevColors = colorsActive()
+    setColorsEnabled(true)
+    defer: setColorsEnabled(prevColors)
+
+    let t = newTranscript()
+    discard t.beginSegment(segUser, "hello")
+    for i in 0 ..< 40:
+      t.addLines(["transcript " & $i])
+    let ed = newInputEditor()
+    ed.setText("draft prompt")
+    let status = EditorStatusInfo(modelLabel: "local-model", contextPct: 12, contextWindow: 200000)
+
+    let frame = t.composeScreen(ed, status, 70, 16)
+    check frame.len == 16
+    let tail = stripAnsi(frame[^1])
+    check "local-model" in tail
+    check "ni" in tail
+    check "draft prompt" in stripAnsi(frame[^3])
+    check "transcript 39" in stripAnsi(frame[0 ..< 12].join("\n"))
+    for row in frame:
+      check visibleWidth(row) <= 69
+
+  test "paintDiff only repaints changed rows":
+    let frame = @["alpha", "beta", "gamma"]
+    check paintDiff(frame, frame) == ""
+    check paintDiff(@["alpha", "BETA", "gamma"], frame) == "\x1b[2;1Hbeta\x1b[K"
+    check paintDiff(@["alpha"], frame) == "\x1b[1;1Halpha\x1b[K\x1b[2;1Hbeta\x1b[K\x1b[3;1Hgamma\x1b[K"
+    check paintDiff(frame, frame, fullRepaint = true).count("\x1b[") == 6
 
 suite "Native Anthropic & Gemini Streaming Providers, Prompt Templates, Fuzzy Edit, and RPC":
   test "Anthropic Messages (/v1/messages) SSE streaming, prompt caching, merged tool_result, and signature replay":

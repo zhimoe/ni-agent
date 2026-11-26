@@ -5,7 +5,7 @@ when defined(windows):
   import std/winlean
 else:
   import std/posix
-import ./[types, config, tools]
+import ./[types, config, tools, utf8]
 
 const
   McpProtocolVersion* = "2025-03-26"
@@ -697,8 +697,10 @@ proc middleTruncateMcpText*(text, serverName: string): tuple[output: string, sav
     return (text, "")
   let saved = saveFullOutputTemp("mcp-" & sanitizeMcpIdent(serverName), text)
   let half = McpToolMaxTextBytes div 2
-  let omitted = text.len - (half * 2)
-  var clipped = text[0 ..< half] & "\n…" & $omitted & " chars truncated…\n" & text[text.len - half .. ^1]
+  let headEnd = utf8BoundaryBefore(text, half)
+  let tailStart = utf8BoundaryAfter(text, text.len - half)
+  let omitted = tailStart - headEnd
+  var clipped = text[0 ..< headEnd] & "\n…" & $omitted & " bytes truncated…\n" & text[tailStart .. ^1]
   if saved.len > 0:
     clipped.add("\n[Full MCP tool result saved to " & saved & "]")
   (clipped, saved)
