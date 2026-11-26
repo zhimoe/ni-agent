@@ -1,7 +1,7 @@
 # Interactive multi-line TUI input editor: UTF-8/CJK cursor editing, undo/kill-ring, persistent history, bracketed paste markers, $EDITOR, and /command + @file autocomplete.
 
 import std/[algorithm, json, options, os, osproc, strutils, tables, unicode]
-import ./terminal_io
+import ./[brand, terminal_io]
 
 const
   MaxHistoryEntries* = 200
@@ -1000,6 +1000,33 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
       let oneLine = status.queuedMessages[i].replace("\n", " ").strip()
       result.add("  " & styleYellow("↳ Queued: ") & styleDim(truncateVisible(oneLine, cols - 12)))
 
+  # Suggestions grow upward so opening the menu keeps the input and footer in place.
+  if menuRows > 0:
+    let showCount = menuRows > 1 and (totalSuggestions > menuRows or menuRows > AutocompleteMaxVisible)
+    let shown = menuRows - int(showCount)
+    var startIdx = 0
+    if ed.acIndex >= shown:
+      startIdx = ed.acIndex - shown + 1
+
+    var primaryWidth = 16
+    for i in startIdx ..< startIdx + shown:
+      primaryWidth = clamp(max(primaryWidth, visibleWidth(ed.acItems[i].display) + 2), 16, 36)
+    primaryWidth = min(primaryWidth, cols - 4)
+
+    for i in startIdx ..< startIdx + shown:
+      let item = ed.acItems[i]
+      let selected = (i == ed.acIndex)
+      let marker = if selected: styleCyan("  ▸ ") else: "    "
+      let col1Raw = padRightVisible(truncateVisible(item.display, primaryWidth - 1), primaryWidth)
+      let col1 = if selected: styleBold(styleCyan(col1Raw)) else: col1Raw
+      let descAvail = cols - 4 - primaryWidth
+      let desc = if item.description.len > 0: styleDim(truncateVisible(item.description, descAvail)) else: ""
+      result.add(marker & col1 & desc)
+
+    if showCount:
+      let hint = "    (" & $(ed.acIndex + 1) & "/" & $totalSuggestions & " — ↑/↓ select, Tab complete, Esc close)"
+      result.add(styleDim(truncateVisible(hint, cols)))
+
   result.add(renderTopBorderWithStatus(cols, status.workingStatus))
 
   let prefixFirst = styleBold(styleCyan("❯ "))
@@ -1035,15 +1062,15 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
   result.add(styleDim("─".repeat(cols)))
 
   # Two-column justified footer matching Pi's FooterComponent:
-  # Left:  ~/workspace (branch) [• sessionName]
+  # Left:  🌿 ni · ~/workspace (branch) [• sessionName]
   # Right: ↑in ↓out [Rcache] [$cost] [ctx%/win] · model:thinking
-  var leftStr = ""
+  var leftRest = ""
   if status.cwd.len > 0:
-    leftStr = shortenPathForStatus(status.cwd, max(16, cols div 3))
+    leftRest.add(" · " & shortenPathForStatus(status.cwd, max(16, cols div 3)))
     if status.gitBranch.len > 0:
-      leftStr.add(" (" & status.gitBranch & ")")
+      leftRest.add(" (" & status.gitBranch & ")")
     if status.sessionName.len > 0:
-      leftStr.add(" • " & truncateVisible(status.sessionName, 18))
+      leftRest.add(" • " & truncateVisible(status.sessionName, 18))
 
   var statsParts: seq[string] = @[]
   if status.inputTokens > 0:
@@ -1083,7 +1110,7 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
   elif statsParts.len > 0:
     rightStyled = styleDim(statsParts.join(" "))
 
-  let leftStyled = styleDim(leftStr)
+  let leftStyled = styleBold(styleCyan(NiEmoji & " ni")) & styleDim(leftRest)
   let leftW = visibleWidth(leftStyled)
   let rightW = visibleWidth(rightStyled)
 
@@ -1099,33 +1126,6 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
       result.add(truncateVisible(rightStyled, cols))
   else:
     result.add(truncateVisible(leftStyled & "  " & rightStyled, cols))
-
-  # Autocomplete popup list (if active)
-  if menuRows > 0:
-    let showCount = menuRows > 1 and (totalSuggestions > menuRows or menuRows > AutocompleteMaxVisible)
-    let shown = menuRows - int(showCount)
-    var startIdx = 0
-    if ed.acIndex >= shown:
-      startIdx = ed.acIndex - shown + 1
-
-    var primaryWidth = 16
-    for i in startIdx ..< startIdx + shown:
-      primaryWidth = clamp(max(primaryWidth, visibleWidth(ed.acItems[i].display) + 2), 16, 36)
-    primaryWidth = min(primaryWidth, cols - 4)
-
-    for i in startIdx ..< startIdx + shown:
-      let item = ed.acItems[i]
-      let selected = (i == ed.acIndex)
-      let marker = if selected: styleCyan("  ▸ ") else: "    "
-      let col1Raw = padRightVisible(truncateVisible(item.display, primaryWidth - 1), primaryWidth)
-      let col1 = if selected: styleBold(styleCyan(col1Raw)) else: col1Raw
-      let descAvail = cols - 4 - primaryWidth
-      let desc = if item.description.len > 0: styleDim(truncateVisible(item.description, descAvail)) else: ""
-      result.add(marker & col1 & desc)
-
-    if showCount:
-      let hint = "    (" & $(ed.acIndex + 1) & "/" & $totalSuggestions & " — ↑/↓ select, Tab complete, Esc close)"
-      result.add(styleDim(truncateVisible(hint, cols)))
 
 # Interactive prompt read loop
 

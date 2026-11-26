@@ -128,8 +128,10 @@ suite "TUI Layout, Multi-line Input Editor, and Terminal Markdown Renderer":
     ed.acItems = @[AutocompleteItem(display: "provider/very-long-model", description: "Very long model description")]
     let menu = renderEditorFrame(ed, status, 22, maxRows = 7)
     check menu.len <= 7
-    check "queued messages" in stripAnsi(menu.join("\n"))
-    check "provider/" in stripAnsi(menu[^1])
+    check "queued messages" in stripAnsi(menu[0])
+    check "provider/" in stripAnsi(menu[1])
+    check "❯ /model" in stripAnsi(menu[^3])
+    check "local-model" in stripAnsi(menu[^1])
     for line in menu:
       check visibleWidth(line) <= 22
 

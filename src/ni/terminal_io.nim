@@ -154,6 +154,16 @@ proc styleBlue*(s: string): string = ansiWrap("34", s)
 proc styleMagenta*(s: string): string = ansiWrap("35", s)
 proc styleCyan*(s: string): string = ansiWrap("36", s)
 proc styleGray*(s: string): string = ansiWrap("90", s)
+proc styleRgb*(s: string, r, g, b: int): string =
+  ## Wrap text in a 24-bit foreground color when ANSI styling is active.
+  if not colorsEnabled or s.len == 0:
+    return s
+  "\x1b[38;2;" & $r & ";" & $g & ";" & $b & "m" & s & "\x1b[0m"
+proc styleAnsi256*(s: string, index: int): string =
+  ## Wrap text in an xterm-256 foreground color when ANSI styling is active.
+  if not colorsEnabled or s.len == 0:
+    return s
+  "\x1b[38;5;" & $max(0, min(255, index)) & "m" & s & "\x1b[0m"
 proc styleInlineCode*(s: string): string =
   if not colorsEnabled or s.len == 0: s
   else: "\x1b[38;5;215;48;5;236m" & s & "\x1b[0m"

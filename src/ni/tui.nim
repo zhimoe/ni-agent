@@ -1,9 +1,7 @@
 # Interactive Docked TUI (persistent bottom input bar, live status border, searchable /model selector, streaming Markdown), print & JSONL modes.
 
 import std/[algorithm, json, options, os, sets, strutils, tables]
-import ./[types, config, trust, provider, tools, skills, mcp, session, prompt, agent, terminal_io, keybindings, editor, markdown]
-
-const SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+import ./[types, config, trust, provider, tools, skills, mcp, session, prompt, agent, brand, terminal_io, keybindings, editor, markdown]
 
 type
   DockViewport* = ref object
@@ -11,15 +9,14 @@ type
     ed*: InputEditor
     followUpKeys: set[KeyKind]
     gitBranch*: string
-    workingStatus*: string
+    workingPhase: string
+    workingDetail: string
     transcriptLines: seq[string]
     activeTailLines*: seq[string]
-    drawnLineCount*: int
+    drawnFrame: seq[string]
     drawnSize: tuple[cols: int, rows: int]
     suspended*: bool
-    spinnerTick*: int
-    turnStartMs*: int64
-    lastTickMs*: int64
+    turnStartMs: int64
 
   ModelPickResult = object
     cancelled: bool
@@ -185,18 +182,50 @@ proc newDockViewport*(rt: AgentRuntime, ed: InputEditor): DockViewport =
     rt: rt,
     ed: ed,
     followUpKeys: loadFollowUpKeys(rt.cfg.agentDir),
-    gitBranch: detectGitBranch(rt.cfg.cwd),
-    workingStatus: "",
-    activeTailLines: @[],
-    drawnLineCount: 0,
-    suspended: false,
-    spinnerTick: 0,
-    turnStartMs: 0,
-    lastTickMs: 0
+    gitBranch: detectGitBranch(rt.cfg.cwd)
   )
 
 proc isDockedActive(vp: DockViewport): bool =
   not vp.isNil and isInteractiveTerminal() and not vp.suspended
+
+proc setWorkingStatus(vp: DockViewport, phase = "", detail = "") =
+  vp.workingPhase = phase
+  vp.workingDetail = detail
+
+proc setThinkingStatus(vp: DockViewport, chars: int) =
+  vp.setWorkingStatus("Thinking", align(formatCompactCount(chars), 6) & " chars")
+
+const
+  SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+  SpinnerIntervalMs = 100
+
+proc elapsedMilliseconds(vp: DockViewport): int64 =
+  max(0'i64, nowUnixMs() - vp.turnStartMs)
+
+proc formatWorkingStatus(vp: DockViewport): string =
+  if vp.workingPhase.len == 0:
+    return ""
+  if vp.workingPhase == "Interrupting":
+    return styleYellow("Interrupting…")
+  let elapsedMs = vp.elapsedMilliseconds()
+  let spinner = SpinnerFrames[(elapsedMs div SpinnerIntervalMs) mod SpinnerFrames.len]
+  let elapsed = elapsedMs div 1000
+  let minutes = align($(elapsed div 60), 2, '0')
+  let seconds = align($(elapsed mod 60), 2, '0')
+  styleCyan(spinner & " " & vp.workingPhase) & styleDim(" " & minutes & ":" & seconds & "s" &
+    (if vp.workingDetail.len > 0: " · " & vp.workingDetail else: ""))
+
+proc updateDockRows(output: var string, previous, next: openArray[string], rows: int) =
+  let start = output.len
+  for offset in countdown(max(previous.len, next.len), 1):
+    let oldLine = if offset <= previous.len: previous[previous.len - offset] else: ""
+    let newLine = if offset <= next.len: next[next.len - offset] else: ""
+    if oldLine != newLine:
+      if output.len == start:
+        output.add("\x1b7") # The transcript cursor stays at its append position.
+      output.add("\x1b[" & $(rows - offset + 1) & ";1H" & newLine & "\x1b[K")
+  if output.len > start:
+    output.add("\x1b8")
 
 proc redrawDock*(vp: DockViewport, commitLinesFirst: openArray[string] = []) =
   ## Atomically write any permanent scrollback lines, redraw the active streaming Markdown tail, and re-anchor the bottom input dock.
@@ -211,30 +240,45 @@ proc redrawDock*(vp: DockViewport, commitLinesFirst: openArray[string] = []) =
 
   let size = terminalSize()
   let (cols, rows) = size
-  let status = buildEditorStatus(vp.rt, vp.gitBranch, vp.workingStatus)
-  let dockLines = renderEditorFrame(vp.ed, status, cols, rows - 2)
+  # Leave the last column free so painting the bottom row cannot trigger terminal auto-wrap.
+  let width = cols - 1
+  let status = buildEditorStatus(vp.rt, vp.gitBranch, vp.formatWorkingStatus())
+  let dockLines = renderEditorFrame(vp.ed, status, width, rows - 2)
   # The Markdown renderer owns scrollback commits. A taller editor can temporarily hide part of its tail.
   let tailCount = min(vp.activeTailLines.len, rows - dockLines.len - 1)
 
   for line in commitLinesFirst:
     vp.transcriptLines.add(line)
-  beginSyncOutput()
+  var frame = newSeqOfCap[string](tailCount + dockLines.len)
+  for i in (vp.activeTailLines.len - tailCount) ..< vp.activeTailLines.len:
+    frame.add(truncateVisible(vp.activeTailLines[i], width))
+  for line in dockLines:
+    frame.add(truncateVisible(line, width, ellipsis = ""))
+
+  var output = ""
   if vp.drawnSize.cols > 0 and size != vp.drawnSize:
     # The terminal may already have moved preview rows into scrollback during the resize.
-    stdout.write("\x1b[2J\x1b[H\x1b[3J")
+    output.add("\x1b[2J\x1b[H\x1b[3J")
+    vp.drawnFrame.setLen(0)
     for line in vp.transcriptLines:
-      stdout.writeLine(line)
-  else:
-    clearRenderedLines(vp.drawnLineCount)
+      output.add(line & "\r\n")
+  elif commitLinesFirst.len > 0 or frame.len > vp.drawnFrame.len:
+    # Erase the old frame before transcript output can scroll it into the history.
+    output.updateDockRows(vp.drawnFrame, [], rows)
+    vp.drawnFrame.setLen(0)
     for line in commitLinesFirst:
-      stdout.writeLine(line)
-  for i in (vp.activeTailLines.len - tailCount) ..< vp.activeTailLines.len:
-    stdout.write(truncateVisible(vp.activeTailLines[i], cols) & "\n")
-  for dl in dockLines:
-    stdout.write(dl & "\n")
-  vp.drawnLineCount = tailCount + dockLines.len
+      output.add(line & "\r\n")
+
+  if vp.drawnFrame.len == 0:
+    # Reserve space beneath the transcript cursor. These line feeds scroll only when needed.
+    output.add("\r\n".repeat(frame.len) & "\x1b[" & $frame.len & "A")
+  output.updateDockRows(vp.drawnFrame, frame, rows)
+  vp.drawnFrame = frame
   vp.drawnSize = size
-  endSyncOutput()
+  if output.len > 0:
+    beginSyncOutput()
+    stdout.write(output)
+    endSyncOutput()
 
 proc suspendDock*(vp: DockViewport) =
   ## Temporarily clear the docked input box so a modal selector (`/model`, `ask_question`, `/login`) can render cleanly.
@@ -243,10 +287,13 @@ proc suspendDock*(vp: DockViewport) =
   if vp.isDockedActive():
     if vp.drawnSize.cols > 0 and vp.drawnSize != terminalSize():
       vp.redrawDock()
-    beginSyncOutput()
-    clearRenderedLines(vp.drawnLineCount)
-    vp.drawnLineCount = 0
-    endSyncOutput()
+    var output = ""
+    output.updateDockRows(vp.drawnFrame, [], vp.drawnSize.rows)
+    vp.drawnFrame.setLen(0)
+    if output.len > 0:
+      beginSyncOutput()
+      stdout.write(output)
+      endSyncOutput()
   vp.suspended = true
 
 proc resumeDock*(vp: DockViewport) =
@@ -256,6 +303,11 @@ proc resumeDock*(vp: DockViewport) =
   vp.suspended = false
   vp.gitBranch = detectGitBranch(vp.rt.cfg.cwd)
   vp.redrawDock()
+
+proc handleDockKey(vp: DockViewport, ev: KeyEvent): Option[EditorOutcome] =
+  if ev.kind == kkCtrlL and colorsActive():
+    vp.drawnFrame.setLen(0)
+  vp.ed.handleKeyEvent(ev)
 
 proc printAboveDock*(vp: DockViewport, text: string) =
   ## Commit one or more lines permanently into the transcript above the docked input bar.
@@ -331,13 +383,11 @@ proc indentLines(lines: openArray[string], pad = "  "): seq[string] =
     if l.len == 0: result.add("")
     else: result.add(pad & l)
 
-proc formatWorkingBadge(vp: DockViewport, phase, detail: string): string =
-  let frame = SpinnerFrames[vp.spinnerTick mod SpinnerFrames.len]
-  let elapsedSec = max(0.0, (nowUnixMs() - vp.turnStartMs).float / 1000.0)
-  let timeTag = if elapsedSec >= 1.0: " (" & formatFloat(elapsedSec, ffDecimal, 1) & "s)" else: ""
-  styleCyan(frame & " " & phase) &
-    (if detail.len > 0: styleDim(" · " & detail) else: "") &
-    styleDim(timeTag & " · Esc interrupt")
+proc renderThinkingLines(text: string, cols: int): seq[string] =
+  let lines = text.strip().splitLines()
+  for i, line in lines.pairs:
+    let prefix = if i == 0: "  " & styleDim("💭 ") else: "     "
+    result.add(wrapAnsiText(styleDim(line), max(28, cols - 4), firstIndent = prefix, contIndent = "     "))
 
 proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): AgentEventCallback =
   ## Build a streaming terminal renderer (dock-aware when vp != nil; standalone fallback otherwise).
@@ -392,9 +442,8 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
   proc flushThinkingAboveDock() =
     if thinkingBuf.strip().len > 0 and not hideThinking:
       let (cols, _) = terminalSize()
-      let wrapped = wrapAnsiText(styleDim("💭 " & thinkingBuf.strip().replace("\n", "\n   ")), max(30, cols - 4), firstIndent = "  ", contIndent = "  ")
       vp.activeTailLines.setLen(0)
-      vp.redrawDock(wrapped & @[""])
+      vp.redrawDock(renderThinkingLines(thinkingBuf, cols) & @[""])
     thinkingBuf = ""
 
   proc flushTextAboveDock() =
@@ -418,7 +467,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
       thinkingChars = 0
       inText = false
       mdStream = newStreamMarkdownRenderer(max(28, cols - 4))
-      vp.workingStatus = formatWorkingBadge(vp, "Thinking", ev.modelId)
+      vp.setThinkingStatus(thinkingChars)
       vp.redrawDock()
 
     of aekStream:
@@ -427,10 +476,9 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
       of sekThinkingDelta:
         thinkingChars += sev.thinkingDelta.len
         thinkingBuf.add(sev.thinkingDelta)
-        let detail = vp.rt.currentModel.id & " · " & formatCompactCount(thinkingChars) & " chars"
-        vp.workingStatus = formatWorkingBadge(vp, "Thinking", detail)
+        vp.setThinkingStatus(thinkingChars)
         if not hideThinking:
-          let tailWrapped = wrapAnsiText(styleDim("💭 " & thinkingBuf.strip()), max(28, cols - 4), firstIndent = "  ", contIndent = "     ")
+          let tailWrapped = renderThinkingLines(thinkingBuf, cols)
           if tailWrapped.len > maxErasable:
             vp.activeTailLines = tailWrapped[tailWrapped.len - maxErasable .. ^1]
           else:
@@ -441,7 +489,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
         if thinkingBuf.len > 0:
           flushThinkingAboveDock()
         inText = true
-        vp.workingStatus = formatWorkingBadge(vp, "Generating", vp.rt.currentModel.id)
+        vp.setWorkingStatus("Generating")
         let (committed, activeTail) = mdStream.stepStreamMarkdown(sev.textDelta, maxErasable)
         vp.activeTailLines = indentLines(activeTail, "  ")
         vp.redrawDock(indentLines(committed, "  "))
@@ -451,7 +499,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
           flushThinkingAboveDock()
         if inText:
           flushTextAboveDock()
-        vp.workingStatus = formatWorkingBadge(vp, "Preparing tool", sev.callName)
+        vp.setWorkingStatus("Preparing tool", sev.callName)
         vp.redrawDock()
 
       of sekError:
@@ -471,7 +519,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
         flushTextAboveDock()
       let argSummary = summarizeToolArgs(ev.toolName, ev.toolArgs)
       let toolLine = "  " & styleCyan("⚙ " & ev.toolName) & (if argSummary.len > 0: " " & styleDim(argSummary) else: "")
-      vp.workingStatus = formatWorkingBadge(vp, "Running " & ev.toolName, argSummary)
+      vp.setWorkingStatus("Running " & ev.toolName, argSummary)
       vp.redrawDock(@[toolLine])
 
     of aekToolEnd:
@@ -498,7 +546,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
         flushTextAboveDock()
 
     of aekRunEnd:
-      vp.workingStatus = ""
+      vp.setWorkingStatus()
       vp.activeTailLines.setLen(0)
       vp.redrawDock()
 
@@ -933,8 +981,7 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
   let runAbort = newAbortFlag()
   activeRunAbort = runAbort
   vp.turnStartMs = nowUnixMs()
-  vp.lastTickMs = vp.turnStartMs
-  vp.spinnerTick = 0
+  var lastSpinnerTick = 0'i64
 
   # Wrap ask_question & security prompt so modal selectors cleanly suspend/resume the docked bar
   let origAsk = rt.askQuestion
@@ -968,11 +1015,11 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
       if (kev.kind == kkEscape and vp.ed.acKind == ackNone) or
           (kev.kind == kkCtrlC and vp.ed.currentText().len == 0):
         runAbort.aborted = true
-        vp.workingStatus = styleYellow("⏹ Interrupting current turn…")
+        vp.setWorkingStatus("Interrupting")
       else:
         let followUp = kev.kind in vp.followUpKeys
         let inputKey = if followUp: KeyEvent(kind: kkEnter) else: kev
-        let outOpt = vp.ed.handleKeyEvent(inputKey)
+        let outOpt = vp.handleDockKey(inputKey)
         if outOpt.isSome and outOpt.get.kind == eokSubmit and outOpt.get.text.strip().len > 0:
           if followUp:
             rt.followUpQueue.add(QueuedPrompt(text: outOpt.get.text))
@@ -980,21 +1027,17 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
             rt.steeringQueue.add(QueuedPrompt(text: outOpt.get.text))
       vp.redrawDock()
 
-    let nowMs = nowUnixMs()
-    if nowMs - vp.lastTickMs >= 95:
-      vp.lastTickMs = nowMs
-      inc vp.spinnerTick
-      if vp.workingStatus.len > 0 and not runAbort.aborted:
-        # Refresh spinner frame & elapsed timer
-        vp.workingStatus = formatWorkingBadge(vp, "Working", rt.currentModel.id)
-        vp.redrawDock()
+    let spinnerTick = vp.elapsedMilliseconds() div SpinnerIntervalMs
+    if terminalSize() != vp.drawnSize or (vp.workingPhase.len > 0 and spinnerTick != lastSpinnerTick and not runAbort.aborted):
+      lastSpinnerTick = spinnerTick
+      vp.redrawDock()
 
   defer:
     rt.providerRegistry.onIdleTick = nil
     rt.askQuestion = origAsk
     rt.security.prompt = origSecPrompt
     activeRunAbort = nil
-    vp.workingStatus = ""
+    vp.setWorkingStatus()
     vp.activeTailLines.setLen(0)
 
   discard rt.runPrompt(
@@ -1009,21 +1052,23 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
   ## Start the interactive ni TUI with a persistent docked input box and live Markdown rendering.
   installCtrlCHandler()
   let keyReady = rt.providerRegistry.resolveProviderApiKey(rt.cfg, rt.currentModel.provider, rt.cliApiKey).isSome
+  let interactive = isInteractiveTerminal()
 
-  var banner = @[
-    styleBold("ni v0.2.0") & styleDim(" — Fast Nim coding agent (Pi config compatible)"),
+  var banner: seq[string] = @[]
+  banner.add(styleBold(styleCyan(NiEmoji & " ni v0.2.0")) & styleDim(" — Fast Nim coding agent (Pi config compatible)"))
+  banner.add(
     styleDim("  Model     : ") & styleCyan(rt.currentModel.provider & "/" & rt.currentModel.id) &
                    styleDim(" (" & rt.currentModel.name & ")") &
-                   (if keyReady: styleGreen(" ✓") else: styleYellow(" (no key — run /login " & rt.currentModel.provider & ")")),
+                   (if keyReady: styleGreen(" ✓") else: styleYellow(" (no key — run /login " & rt.currentModel.provider & ")")))
+  banner.add(
     styleDim("  Resources : ") &
                    $rt.toolRegistry.activeNames.len & " tools · " &
                    $rt.skills.len & " skills · " &
                    $rt.promptTemplates.len & " prompts · " &
                    $rt.mcpManager.servers.len & " MCP" &
-                   (if rt.cfg.contextFiles.len > 0: " · " & $rt.cfg.contextFiles.len & " AGENTS.md" else: ""),
-    styleDim("  Shortcuts : /model switch · /help commands · Tab complete · Ctrl+J newline · Esc interrupt"),
-    ""
-  ]
+                   (if rt.cfg.contextFiles.len > 0: " · " & $rt.cfg.contextFiles.len & " AGENTS.md" else: ""))
+  banner.add(styleDim("  Shortcuts : /model switch · /help commands · Tab complete · Ctrl+J newline · Esc interrupt"))
+  banner.add("")
   for d in rt.cfg.diagnostics & rt.mcpManager.diagnostics:
     banner.add("  " & styleYellow("! " & d))
 
@@ -1034,7 +1079,6 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
     modelItems = buildModelAutocompleteItems(rt)
   )
   let vp = newDockViewport(rt, ed)
-  let interactive = isInteractiveTerminal()
   if interactive:
     enterRawTerminalMode()
   defer:
@@ -1081,7 +1125,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       vp.resumeDock()
       continue
 
-    let outcomeOpt = ed.handleKeyEvent(ev, allowExternalEditor = false)
+    let outcomeOpt = vp.handleDockKey(ev)
     if outcomeOpt.isNone:
       sigintCount = 0
       vp.redrawDock()
@@ -1122,11 +1166,11 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       let runAbort = newAbortFlag()
       activeRunAbort = runAbort
       vp.turnStartMs = nowUnixMs()
-      vp.workingStatus = formatWorkingBadge(vp, "Running shell", shCmd)
+      vp.setWorkingStatus("Running shell", shCmd)
       vp.redrawDock()
       let res = runProcessCapture(exe, baseArgs & @[shCmd], rt.cfg.cwd, nil, 0.0, runAbort)
       activeRunAbort = nil
-      vp.workingStatus = ""
+      vp.setWorkingStatus()
       var outLines: seq[string] = @[]
       if res.output.len > 0:
         for ol in res.output.replace("\r\n", "\n").strip(leading = false, trailing = true).split('\n'):
@@ -1406,10 +1450,10 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
                 break
       of "/compact":
         vp.turnStartMs = nowUnixMs()
-        vp.workingStatus = formatWorkingBadge(vp, "Compacting", "summarizing older context")
+        vp.setWorkingStatus("Compacting", "summarizing older context")
         vp.redrawDock()
         let res = rt.compactSession(force = true)
-        vp.workingStatus = ""
+        vp.setWorkingStatus()
         if res.isSome:
           vp.printAboveDock("  " & styleGreen("✓ Compacted session history."))
         else:
