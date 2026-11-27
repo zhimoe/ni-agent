@@ -8,6 +8,7 @@
 - 全屏时把消息、工具输出和提示交给 `Transcript` 或 dock。全屏帧由 `paintScreen` 统一写入。弹窗或外部编辑器临时接管时用 `suspendDock` 和 `resumeDock`，恢复时使上一帧缓存失效。新增终端模式时把进入和清理写成对，覆盖正常退出、中断和可捕获的错误。 [Ratatui 的终端恢复](https://ratatui.rs/recipes/apps/panic-hooks/) · [Pi 的组件与弹窗](https://github.com/earendil-works/pi/blob/v1.6.0/packages/coding-agent/docs/tui.md)
 - `redrawDock` 提交状态并请求绘制。滚轮、模型增量和状态提示共用 17 ms 帧间隔。回复结尾和弹窗恢复可立即提交最新状态。排查高频事件先测帧数，兼顾空闲后最后一帧的提交。 [Bubble Tea 帧调度](https://github.com/charmbracelet/bubbletea/blob/v2.2.0/tea.go)
 - 将一次帧提交放在 `CSI ? 2026 h` 与 `CSI ? 2026 l` 之间并及时刷新。同步输出取决于终端和中间层是否支持，差量输出和事件合并在任何终端都需要独立成立。 [Contour 同步输出规范](https://contour-terminal.org/vt-extensions/synchronized-output/) · [ncurses 的批量刷新](https://invisible-island.net/ncurses/ncurses-intro.html#flush)
+- Windows CMD 可能未设置 `TERM`。根据 `GetConsoleMode` 和启用虚拟终端输出的结果选择全屏。交互终端在全屏不可用时仍须显示行内编辑器或原生行提示。Windows 全屏每次提交帧后应把控制台光标定位到输入框的实际单元格，供输入法定位候选窗口。退出时先刷新输出，再恢复代码页和输出模式。 [Windows 控制台模式](https://learn.microsoft.com/en-us/windows/console/setconsolemode) · [Windows Unicode 行输入](https://learn.microsoft.com/en-us/windows/console/readconsole)
 
 ## 视口和滚动
 

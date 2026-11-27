@@ -1,7 +1,7 @@
 # Interactive Docked TUI (persistent bottom input bar, live status border, searchable /model selector, streaming Markdown), print & JSONL modes.
 
 import std/[algorithm, json, monotimes, options, os, sets, strutils, tables, times]
-import ./[types, config, trust, provider, tools, skills, mcp, session, agent, brand, terminal_io, keybindings, editor, markdown, viewport, utf8, release_info]
+import ./[types, config, trust, provider, tools, skills, mcp, session, agent, brand, terminal_io, keybindings, editor, markdown, viewport, utf8, release_info, herdr]
 
 type
   DockViewport* = ref object
@@ -18,6 +18,8 @@ type
     contextPct: int
     activeTailLines*: seq[string]
     drawnFrame: seq[string]
+    when defined(windows):
+      drawnCaret: EditorCaret
     drawnSize: tuple[cols: int, rows: int]
     drawnHistory: tuple[rows, endLine: int]
     paintPending: bool
@@ -44,6 +46,7 @@ proc installCtrlCHandler() =
       if sigintCount >= 2:
         exitFullScreen()
         exitRawTerminalMode()
+        restoreTerminal()
         quit(130)
   )
 
@@ -224,7 +227,11 @@ proc paintScreen(vp: DockViewport) =
     vp.contextRevision = revision
   let second = if vp.workingPhase.len > 0: vp.elapsedWorkingSeconds() else: 0'i64
   let status = buildEditorStatus(rt, vp.gitBranch, vp.formatWorkingStatus(second), vp.contextPct)
-  let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows)
+  when defined(windows):
+    var caret: EditorCaret
+    let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows, addr caret)
+  else:
+    let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows)
   let history = vp.transcript.historyView()
   let scrollRows = if history.rows == vp.drawnHistory.rows:
     history.endLine - vp.drawnHistory.endLine else: 0
@@ -233,6 +240,11 @@ proc paintScreen(vp: DockViewport) =
     output.add("\x1b[2J")
   output.add(paintDiff(vp.drawnFrame, frame, fullRepaint = full,
     historyRows = history.rows, scrollRows = scrollRows))
+  when defined(windows):
+    # Keep the console's own caret at the editor position for IME composition.
+    if output.len > 0 or caret != vp.drawnCaret:
+      output.add("\x1b[" & $(caret.row + 1) & ";" & $(caret.col + 1) & "H")
+    vp.drawnCaret = caret
   if output.len > 0:
     # Keep wide glyphs from wrapping into adjacent rows during a diff repaint.
     writeSyncOutput("\x1b[?7l" & output & "\x1b[?7h")
@@ -1217,14 +1229,15 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
       defer:
         enterRawTerminalMode()
         vp.resumeDock()
-      promptAskQuestionsInteractive(questions)
+      if origAsk.isNil: promptAskQuestionsInteractive(questions) else: origAsk(questions)
     rt.security.prompt = proc(action: PermissionAction, target, reason: string): PermissionDecision =
       vp.suspendDock()
       exitRawTerminalMode()
       defer:
         enterRawTerminalMode()
         vp.resumeDock()
-      interactiveSecurityPrompt(action, target, reason)
+      if origSecPrompt.isNil: interactiveSecurityPrompt(action, target, reason)
+      else: origSecPrompt(action, target, reason)
 
   rt.providerRegistry.onIdleTick = proc() =
     # Poll non-blocking user keys while waiting on LLM SSE stream
@@ -1272,8 +1285,28 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
 proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq[string] = @[]): int =
   ## Start the interactive ni TUI with a persistent docked input box and live Markdown rendering.
   installCtrlCHandler()
+  let reporter = newHerdrReporter()
+  let ask = rt.askQuestion
+  let permission = rt.security.prompt
+  if not reporter.isNil:
+    if not ask.isNil:
+      rt.askQuestion = proc(questions: seq[AskQuestionItem]): seq[AskQuestionAnswer] =
+        let previous = reporter.state
+        reporter.report(hsBlocked)
+        defer: reporter.report(previous)
+        ask(questions)
+    if not permission.isNil:
+      rt.security.prompt = proc(action: PermissionAction, target, reason: string): PermissionDecision =
+        let previous = reporter.state
+        reporter.report(hsBlocked)
+        defer: reporter.report(previous)
+        permission(action, target, reason)
+  defer:
+    rt.askQuestion = ask
+    rt.security.prompt = permission
+    reporter.close()
+
   let keyReady = rt.providerRegistry.resolveProviderApiKey(rt.cfg, rt.currentModel.provider, rt.cliApiKey).isSome
-  let interactive = isInteractiveTerminal()
 
   var banner: seq[string] = @[]
   banner.add(styleBold(styleCyan(NiEmoji & " ni v" & NiVersion)) & styleDim(" — Fast Nim coding agent (Pi config compatible)"))
@@ -1300,16 +1333,22 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
     modelItems = buildModelAutocompleteItems(rt)
   )
   let vp = newDockViewport(rt, ed)
-  if interactive:
+  if vp.fullScreen:
     enterRawTerminalMode()
-    if vp.fullScreen:
-      enterFullScreen()
+    enterFullScreen()
   defer:
-    if interactive:
+    if vp.fullScreen:
       vp.suspendDock()
-      if vp.fullScreen:
-        exitFullScreen()
+      exitFullScreen()
       exitRawTerminalMode()
+
+  proc runTurn(prompt: string, explicitFiles: seq[string] = @[]) =
+    reporter.report(hsWorking)
+    defer: reporter.report(hsIdle)
+    if vp.fullScreen:
+      runAgentTurnDocked(vp, prompt, explicitFiles)
+    else:
+      discard rt.runPrompt(prompt, explicitFiles, onEvent = makeInteractiveEventPrinter(rt.cfg.settings.hideThinkingBlock))
 
   vp.restoreTranscript(banner)
   if initialPrompt.strip().len > 0 or initialFiles.len > 0:
@@ -1318,20 +1357,22 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       vp.beginUserTurn(initialPrompt, cols)
     else:
       vp.redrawDock()
-    runAgentTurnDocked(vp, initialPrompt, initialFiles)
+    runTurn(initialPrompt, initialFiles)
+  else:
+    reporter.report(hsIdle)
 
-  # Non-TTY fallback (e.g. scripted pipe tests)
-  if not interactive:
+  # An inline editor or host-managed line input always remains available.
+  if not vp.fullScreen:
     while true:
       let status = buildEditorStatus(rt, vp.gitBranch)
       let outcome = ed.readPromptInteractive(status)
-      if outcome.kind != eokSubmit:
-        break
+      if outcome.kind == eokEof: break
+      if outcome.kind != eokSubmit: continue
       let trimmed = outcome.text.strip()
       if trimmed in ["/quit", "/exit", "/q"]:
         break
       if trimmed.len > 0:
-        discard rt.runPrompt(outcome.text, onEvent = makeInteractiveEventPrinter(rt.cfg.settings.hideThinkingBlock))
+        runTurn(outcome.text)
     return 0
 
   # Main persistent docked TUI loop
@@ -1389,6 +1430,8 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       if shCmd.len == 0:
         vp.redrawDock()
         continue
+      reporter.report(hsWorking)
+      defer: reporter.report(hsIdle)
       discard vp.transcript.beginSegment(segNotice, "$ " & shCmd)
       vp.redrawDock(@["  " & styleCyan("$ " & shCmd)])
       let runAbort = newAbortFlag()
@@ -1433,7 +1476,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
     if trimmed.startsWith("/") and not trimmed.startsWith("/skill:"):
       if expandPromptTemplateCommand(trimmed, rt.promptTemplates).isSome:
         vp.beginUserTurn(outcome.displayText, cols)
-        runAgentTurnDocked(vp, rawInput)
+        runTurn(rawInput)
         continue
 
       let spIdx = trimmed.find({' ', '\t', '\n'})
@@ -1703,6 +1746,8 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
             except IOError, OSError:
               vp.printAboveDock("  " & styleRed(getCurrentExceptionMsg()))
       of "/compact":
+        reporter.report(hsWorking)
+        defer: reporter.report(hsIdle)
         vp.workingStarted = getMonoTime()
         vp.setWorkingStatus("Compacting", "summarizing older context")
         vp.redrawDock()
@@ -1728,6 +1773,6 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
 
     # 3. Normal user message or `/skill:<name>` -> render user block in the transcript + run docked agent turn
     vp.beginUserTurn(outcome.displayText, cols)
-    runAgentTurnDocked(vp, rawInput)
+    runTurn(rawInput)
 
   0

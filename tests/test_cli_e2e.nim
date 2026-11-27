@@ -167,16 +167,19 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       check mcpJson["servers"][0]["state"].getStr() == "connected"
       check mcpJson["servers"][0]["tools"][0]["qualifiedName"].getStr() == "mcp__remote_http__ping_http"
 
+      proc execInWorkspace(command: string): tuple[output: string, exitCode: int] =
+        execCmdEx(command, workingDir = ws)
+
       # 3. Test `ni --print` over real AsyncHttpClient SSE + `read` tool execution in workspace
-      let (pOut, pCode) = execCmdEx(
-        "cd " & quoteShell(ws) & " && " & quoteShell(niBin) &
+      let (pOut, pCode) = execInWorkspace(
+        quoteShell(niBin) &
         " -p --model mocklocal/local-coder --agent-dir " & quoteShell(agentDir) &
         " \"Read note.txt and report its content\""
       )
       check pCode == 0
       check "Found: NIM_SECRET_NUMBER=777" in pOut
-      let (disabledOut, disabledCode) = execCmdEx(
-        "cd " & quoteShell(ws) & " && " & quoteShell(niBin) &
+      let (disabledOut, disabledCode) = execInWorkspace(
+        quoteShell(niBin) &
         " -p --no-tools --no-session --model mocklocal/local-coder --agent-dir " & quoteShell(agentDir) &
         " \"Inspect note.txt\""
       )
@@ -185,8 +188,8 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       check "NIM_SECRET_NUMBER=777" notin disabledOut
 
       # 4. Test `ni --mode json` structured JSONL event stream
-      let (jOut, jCode) = execCmdEx(
-        "cd " & quoteShell(ws) & " && " & quoteShell(niBin) &
+      let (jOut, jCode) = execInWorkspace(
+        quoteShell(niBin) &
         " --mode json --no-session --model mocklocal/local-coder --agent-dir " & quoteShell(agentDir) &
         " \"Inspect note.txt\""
       )
@@ -199,7 +202,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       check ephemeralHeader["cwd"] == %expandFilename(ws)
 
       let sessions = root / "sessions"
-      let cli = "cd " & quoteShell(ws) & " && " & quoteShellCommand([niBin, "--no-mcp",
+      let cli = quoteShellCommand([niBin, "--no-mcp",
         "--model", "mocklocal/local-coder", "--agent-dir", agentDir, "--session-dir", sessions])
       let (versionOut, versionCode) = execCmdEx(quoteShellCommand([niBin, "--version"]))
       check versionCode == 0
@@ -212,13 +215,13 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
         (@["--model"], "Missing value for --model"),
         (@["--session-id", "a/../bad"], "--session-id expects")
       ]:
-        let (outp, code) = execCmdEx(cli & " " & quoteShellCommand(@["-p", "Record the seed"] & invalid))
+        let (outp, code) = execInWorkspace(cli & " " & quoteShellCommand(@["-p", "Record the seed"] & invalid))
         check code == 1
         check expected in outp
         check "Recorded" notin outp
       check not dirExists(sessions)
 
-      let (_, seedCode) = execCmdEx(cli & " -p --session-id audit-session " & quoteShell("Record the seed"))
+      let (_, seedCode) = execInWorkspace(cli & " -p --session-id audit-session " & quoteShell("Record the seed"))
       require seedCode == 0
       var savedFiles: seq[string]
       for path in walkDirRec(sessions):
@@ -228,7 +231,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       let savedPath = parentDir(savedFiles[0]) / "20260101T000000_audit-session.jsonl"
       moveFile(savedFiles[0], savedPath)
 
-      let (resumeOut, resumeCode) = execCmdEx(cli & " --mode json --session-id audit-session " & quoteShell("Recall the seed"))
+      let (resumeOut, resumeCode) = execInWorkspace(cli & " --mode json --session-id audit-session " & quoteShell("Recall the seed"))
       check resumeCode == 0
       check "History was loaded" in resumeOut
       let original = readFile(savedPath)
@@ -237,7 +240,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
 
       var beforeFork: seq[string]
       for path in walkDirRec(sessions): beforeFork.add(path)
-      let (forkOut, forkCode) = execCmdEx(cli & " -p --no-session --fork " & quoteShell(savedPath) & " " &
+      let (forkOut, forkCode) = execInWorkspace(cli & " -p --no-session --fork " & quoteShell(savedPath) & " " &
         quoteShell("Recall the seed"))
       check forkCode == 0
       check "History was loaded" in forkOut
@@ -251,7 +254,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       require original.endsWith("\n")
       let previous = loadSessionFile(savedPath, persist = false).activeBranchEntries()
       writeFile(savedPath, original[0 ..< original.len - 1])
-      let (noNewlineOut, noNewlineCode) = execCmdEx(cli & " -p --session-id audit-session " & quoteShell("Recall the seed"))
+      let (noNewlineOut, noNewlineCode) = execInWorkspace(cli & " -p --session-id audit-session " & quoteShell("Recall the seed"))
       require noNewlineCode == 0
       check noNewlineOut.strip() == "History was loaded"
       let complete = loadSessionFile(savedPath, persist = false).activeBranchEntries()
@@ -260,7 +263,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
 
       let damaged = readFile(savedPath) & "{\"type\":\"message\",\"id\":"
       writeFile(savedPath, damaged)
-      let (repairOut, repairCode) = execCmdEx(cli & " -p --session-id audit-session " & quoteShell("Recall the seed"))
+      let (repairOut, repairCode) = execInWorkspace(cli & " -p --session-id audit-session " & quoteShell("Recall the seed"))
       require repairCode == 0
       check "Skipped 1 malformed session record" in repairOut
       check "History was loaded" in repairOut
@@ -268,7 +271,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       let restored = loadSessionFile(savedPath, persist = false).activeBranchEntries()
       require restored.len == complete.len + 2
       check restored[complete.high].id == complete[^1].id
-      let (verifiedOut, verifiedCode) = execCmdEx(cli & " -p --no-session --session " & quoteShell(savedPath) & " " &
+      let (verifiedOut, verifiedCode) = execInWorkspace(cli & " -p --no-session --session " & quoteShell(savedPath) & " " &
         quoteShell("Recall the seed"))
       check verifiedCode == 0
       check "History was loaded" in verifiedOut
@@ -287,7 +290,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       require parallelPath.len > 0
       let reservedLog = readFile(parallelPath)
       for args in [@["--session-id", "parallel-session"], @["--session", parallelPath]]:
-        let (busy, busyCode) = execCmdEx(cli & " " & quoteShellCommand(@["-p"] & args & @["Record the seed"]))
+        let (busy, busyCode) = execInWorkspace(cli & " " & quoteShellCommand(@["-p"] & args & @["Record the seed"]))
         check busyCode == 1
         check "Session is already open for writing" in busy
         check "Recorded" notin busy
@@ -300,7 +303,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       owner.inputStream.writeLine("""{"id":"leave","type":"new_session"}""")
       owner.inputStream.flush()
       require parseJson(owner.outputStream.readLine())["success"].getBool()
-      let (afterSwitch, afterSwitchCode) = execCmdEx(cli & " -p --session-id parallel-session " & quoteShell("Record the seed"))
+      let (afterSwitch, afterSwitchCode) = execInWorkspace(cli & " -p --session-id parallel-session " & quoteShell("Record the seed"))
       require afterSwitchCode == 0
       check afterSwitch.strip() == "Recorded"
       owner.inputStream.writeLine($(%*{"id": "return", "type": "switch_session", "sessionPath": parallelPath}))
@@ -308,23 +311,23 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       require parseJson(owner.outputStream.readLine())["success"].getBool()
       owner.terminate()
       discard owner.waitForExit(5000)
-      let (afterOwner, afterOwnerCode) = execCmdEx(cli & " -p --session-id parallel-session " & quoteShell("Recall the seed"))
+      let (afterOwner, afterOwnerCode) = execInWorkspace(cli & " -p --session-id parallel-session " & quoteShell("Recall the seed"))
       check afterOwnerCode == 0
       check afterOwner.strip() == "History was loaded"
       check loadSessionFile(parallelPath, persist = false).activeBranchEntries().len == 4
 
-      let (partialOut, partialCode) = execCmdEx(cli & " -p --no-session " & quoteShell("Truncated tool call"))
+      let (partialOut, partialCode) = execInWorkspace(cli & " -p --no-session " & quoteShell("Truncated tool call"))
       check partialCode == 2
       check "Partial reply" in partialOut
       check "Model response reached its output limit" in partialOut
-      let (lengthOut, lengthCode) = execCmdEx(cli & " --mode json --no-session " & quoteShell("Truncated tool call"))
+      let (lengthOut, lengthCode) = execInWorkspace(cli & " --mode json --no-session " & quoteShell("Truncated tool call"))
       check lengthCode == 2
       check "\"stopReason\":\"length\",\"exitCode\":2" in lengthOut
       check "\"type\":\"tool_execution_start\"" notin lengthOut
 
-      let (limitOut, limitCode) = execCmdEx(cli & " --mode json --no-session " & quoteShell("Use tools forever"))
+      let (limitOut, limitCode) = execInWorkspace(cli & " --mode json --no-session " & quoteShell("Use tools forever"))
       check limitCode == 3
       check "\"turns\":64,\"stopReason\":\"turnLimit\",\"exitCode\":3" in limitOut
-      let (atLimitOut, atLimitCode) = execCmdEx(cli & " -p --no-session " & quoteShell("Finish on turn 64"))
+      let (atLimitOut, atLimitCode) = execInWorkspace(cli & " -p --no-session " & quoteShell("Finish on turn 64"))
       check atLimitCode == 0
       check atLimitOut.strip() == "Completed at the limit"

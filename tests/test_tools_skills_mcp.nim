@@ -267,8 +267,9 @@ for raw in sys.stdin:
       let mgr = newMcpManager(cfg, toolReg, connectNow = true)
       defer: mgr.closeAll()
 
-      check mgr.diagnostics.len == 0
-      check mgr.servers["demo-srv"].state == mcsConnected
+      checkpoint mgr.diagnostics.join("\n")
+      require mgr.diagnostics.len == 0
+      require mgr.servers["demo-srv"].state == mcsConnected
 
       # add_numbers is direct; search_wiki is deferred; tool_search was auto-enabled!
       check "mcp__demo_srv__add_numbers" in toolReg.activeNames

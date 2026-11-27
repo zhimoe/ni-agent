@@ -751,7 +751,9 @@ proc connectServer*(sess: McpServerSession, cfgBundle: ConfigBundle, security: S
           envTable[ek] = resolved.get
       let opts: set[ProcessOption] =
         when defined(windows):
-          {poUsePath, poInteractive, poDaemon}
+          # PeekNamedPipe works with anonymous pipes. Use blocking writes so
+          # a JSONL request cannot be partially written into a full pipe.
+          {poUsePath, poDaemon}
         else:
           {poUsePath}
       let runCwd = if dirExists(sess.config.cwd): sess.config.cwd else: cfgBundle.cwd

@@ -37,6 +37,8 @@ type
     pastes: Table[int, string]
     pasteCounter: int
 
+  EditorCaret* = tuple[row, col: int]
+
   EditorStatusInfo* = object
     cwd*: string
     gitBranch*: string
@@ -906,9 +908,9 @@ proc handleKeyEvent*(ed: InputEditor, ev: KeyEvent, allowExternalEditor = false)
 
 # Visual layout & rendering of the TUI input box, cursor, status bar, and autocomplete popup
 
-proc formatEditorLineWithCursor(line: string, cursorCol, width: int): tuple[rows: seq[string], cursorRow: int] =
+proc formatEditorLineWithCursor(line: string, cursorCol, width: int): tuple[rows: seq[string], caret: EditorCaret] =
   ## Wrap one logical input line into terminal-width visual rows, rendering an inverse-video cursor cell on the active row.
-  result.cursorRow = -1
+  result.caret.row = -1
   var curRow = ""
   var curW = 0
   var i = 0
@@ -925,7 +927,7 @@ proc formatEditorLineWithCursor(line: string, cursorCol, width: int): tuple[rows
       curRow = ""
       curW = 0
     if atCursor:
-      result.cursorRow = result.rows.len
+      result.caret = (result.rows.len, curW)
       if colorsActive():
         curRow.add("\x1b[7m" & glyph & "\x1b[27m")
       else:
@@ -938,7 +940,7 @@ proc formatEditorLineWithCursor(line: string, cursorCol, width: int): tuple[rows
     if curW + 1 > width and curW > 0:
       result.rows.add(curRow)
       curRow = ""
-    result.cursorRow = result.rows.len
+    result.caret = (result.rows.len, curW)
     if colorsActive():
       curRow.add("\x1b[7m \x1b[27m")
     else:
@@ -974,7 +976,8 @@ proc formatCompactCount*(n: int): string =
   else:
     formatFloat(n.float / 1_000_000.0, ffDecimal, 1) & "M"
 
-proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int, maxRows = high(int)): seq[string] =
+proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int,
+                        maxRows = high(int), caret: ptr EditorCaret = nil): seq[string] =
   ## Render the dock with working status above the input and usage in the footer.
   let cols = clamp(termCols, 20, 300)
   # Reserve the two borders, footer, and one visible input row before showing queues or suggestions.
@@ -1031,6 +1034,7 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
 
   let isEmpty = ed.lines.len == 1 and ed.lines[0].len == 0
   if isEmpty:
+    if not caret.isNil: caret[] = (result.len, 2)
     let hintStr = if status.workingStatus.len > 0:
       "Type a message…"
     else:
@@ -1041,18 +1045,20 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
     result.add(prefixFirst & cursorBlock & " " & clippedHint)
   else:
     var wrappedInput: seq[string] = @[]
-    var cursorRow = 0
+    var cursor: EditorCaret
     for lineIdx, line in ed.lines.pairs:
       let col = if lineIdx == ed.cursorLine: ed.cursorCol else: -1
-      let (wrapped, lineCursor) = formatEditorLineWithCursor(line, col, contentWidth)
-      if lineCursor >= 0:
-        cursorRow = wrappedInput.len + lineCursor
+      let (wrapped, lineCaret) = formatEditorLineWithCursor(line, col, contentWidth)
+      if lineCaret.row >= 0:
+        cursor = (wrappedInput.len + lineCaret.row, lineCaret.col)
       for wIdx, wLine in wrapped.pairs:
         let pfx = if lineIdx == 0 and wIdx == 0: prefixFirst else: prefixCont
         wrappedInput.add(pfx & wLine)
 
     # Only the visible rows can be erased on the next redraw.
-    let firstRow = max(0, cursorRow - inputRows + 1)
+    let firstRow = max(0, cursor.row - inputRows + 1)
+    if not caret.isNil:
+      caret[] = (result.len + cursor.row - firstRow, cursor.col + 2)
     result.add(wrappedInput[firstRow ..< min(wrappedInput.len, firstRow + inputRows)])
 
   result.add(border)
@@ -1131,15 +1137,19 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
 
 proc readPromptInteractive*(ed: InputEditor, status: EditorStatusInfo): EditorOutcome =
   ## Run the live TUI editor loop on TTY, or read from stdin line-by-line when non-interactive.
-  if not isInteractiveTerminal():
+  let interactive = isInteractiveTerminal()
+  if not interactive or not supportsAnsiOutput():
+    if interactive:
+      stdout.write("ni> ")
+      stdout.flushFile()
     var line = ""
-    if not stdin.readLine(line):
+    if not readTerminalLine(line):
       return EditorOutcome(kind: eokEof)
     var lines = @[line]
     while lines[^1].endsWith("\\"):
       lines[^1] = lines[^1][0 ..< lines[^1].high]
       var nxt = ""
-      if not stdin.readLine(nxt):
+      if not readTerminalLine(nxt):
         break
       lines.add(nxt)
     let joined = lines.join("\n")
@@ -1147,15 +1157,8 @@ proc readPromptInteractive*(ed: InputEditor, status: EditorStatusInfo): EditorOu
 
   var renderedCount = 0
   stdout.write("\n")
-  if colorsActive():
-    stdout.write("\x1b[?25l")
-  enableBracketedPaste()
-
-  defer:
-    disableBracketedPaste()
-    if colorsActive():
-      stdout.write("\x1b[?25h")
-      stdout.flushFile()
+  enterRawTerminalMode()
+  defer: exitRawTerminalMode()
 
   while true:
     let (cols, rows) = terminalSize()
@@ -1169,7 +1172,14 @@ proc readPromptInteractive*(ed: InputEditor, status: EditorStatusInfo): EditorOu
     endSyncOutput()
 
     let ev = readRawKey()
-    let outcomeOpt = ed.handleKeyEvent(ev, allowExternalEditor = true)
+    if ev.kind == kkCtrlG:
+      exitRawTerminalMode()
+      try:
+        discard ed.handleKeyEvent(ev, allowExternalEditor = true)
+      finally:
+        enterRawTerminalMode()
+      continue
+    let outcomeOpt = ed.handleKeyEvent(ev)
     if outcomeOpt.isSome:
       let outcome = outcomeOpt.get
       beginSyncOutput()

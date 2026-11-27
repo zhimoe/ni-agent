@@ -24,6 +24,22 @@ Ni uses `~/.pi/agent` by default. Pass `--agent-dir` to use a separate configura
 
 从 `dist/windows` 选择 `x64` 或 `arm64`，复制完整目录到 Windows，再从该目录运行 `.\ni.exe`。重新编译和打包见 [Windows 使用与打包说明](docs/windows.md)。
 
+### Herdr
+
+Run `ni` (or `./ni` after building from source) in a Herdr pane. Ni appears automatically in the Agents sidebar and in `herdr agent list`. The sidebar shows when Ni is ready for input, working, or waiting for a decision. The entry disappears when Ni exits. This works with the default Herdr configuration.
+
+For a launch shortcut, add the following to `~/.config/herdr/config.toml` on macOS or Linux, or `%APPDATA%\herdr\config.toml` on Windows. If Ni is outside Herdr's `PATH`, set `command` to its quoted absolute path, for example `command = '"/opt/ni/ni"'`.
+
+```toml
+[[keys.command]]
+key = "prefix+i"
+type = "pane"
+description = "Open Ni"
+command = "ni"
+```
+
+Choose **Reload config** in Herdr (default `Ctrl+B`, then `Shift+R`). Press `Ctrl+B`, then `i` to open Ni in a temporary pane. The pane closes when Ni exits. [Herdr custom command keybindings](https://herdr.dev/tui/docs/configuration/#custom-command-keybindings)
+
 ## Features
 
 - **Providers.** OpenAI Chat Completions and Responses, Anthropic Messages, Google Gemini, and OpenAI-compatible endpoints such as DeepSeek, Kimi, OpenRouter, Ollama, and vLLM. The provider adapters preserve supported thinking signatures across turns.

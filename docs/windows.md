@@ -22,6 +22,28 @@
 
 Ni 默认读取 `%USERPROFILE%\.pi\agent` 中的 Pi 配置。以 OpenAI 为例，在 PowerShell 运行 `.\ni.exe auth login openai` 会提示输入凭据。保存后再运行 `.\ni.exe`。
 
+### CMD 中的中文输入
+
+支持虚拟终端输出的 CMD 会打开全屏输入框，`TERM` 可以留空。用中文输入法选择候选字后，先确认汉字出现在输入框中，再按 Enter 提交整条提示。
+
+如果全屏编辑器里仍只能输入拼音，可以在 CMD 中用 Windows 原生行编辑启动 Ni。看到 `ni>` 时，输入法候选与文本回显由 Windows 控制台处理。
+
+```cmd
+cmd /d /c "set TERM=dumb&& ni.exe"
+```
+
+## 兼容性复测
+
+Windows 控制台的交互模式以 `GetConsoleMode` 的结果为准。管道、文件与 `NUL` 走非交互入口。退出 Ni 时还原进入时的控制台代码页与输出模式。
+
+在有 Python 3 的 Windows 上，从仓库根目录运行下列命令。用当前系统架构的 `ni.exe`，并保留同目录的 DLL 和证书。脚本会新开测试控制台，使用本地模拟模型，验证启动、输入框、汉字与 emoji 的收发、原生行输入、`NUL` 和退出后的控制台状态。
+
+```powershell
+python tests/check_windows_console.py dist/windows/x64/ni.exe
+```
+
+实际输入法的候选窗口和选字仍需分别在传统 CMD 和 Windows Terminal 中验证。自动测试通过 Windows 控制台 API 注入已转换的 Unicode 字符。对话中的历史可用 Page Up、Page Down 和 End 导航，当前 Win32 输入路径只读取键盘记录。Windows 上 `--sandbox read-only` 和 `--sandbox workspace-write` 会明确报错，因为暂未提供受限子进程后端。
+
 ## 在 macOS 或 Linux 重新打包
 
 准备 Nim、Zig 和 Python 3.11 或更新版本。从 Ni 源码根目录运行。

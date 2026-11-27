@@ -17,9 +17,11 @@ suite "Config, Auth, Models, and Trust Security":
     check resolveConfigValue("${NI_TEST_TOKEN}_suffix", cache) == some("tok_abc123_suffix")
     check resolveConfigValue("$$price_$!bang", cache) == some("$price_!bang")
     check resolveConfigValue("$NI_MISSING_ENV_XYZ", cache).isNone
-    check resolveConfigValue("!printf 'cmd_secret_42\\n'", cache) == some("cmd_secret_42")
+    let command = when defined(windows): "cmd.exe /d /c echo cmd_secret_42"
+                  else: "printf 'cmd_secret_42\\n'"
+    check resolveConfigValue("!" & command, cache) == some("cmd_secret_42")
     # Cached second lookup
-    check cache.hasKey("printf 'cmd_secret_42\\n'")
+    check cache.hasKey(command)
 
   test "applyToolListSpec supports replacement lists and +tool/-tool deltas":
     let defaults = @["read", "bash", "edit", "write"]
