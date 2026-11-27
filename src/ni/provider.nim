@@ -1,7 +1,7 @@
 # Extensible LLM provider registry and real-time SSE streaming adapters (OpenAI, DeepSeek, and OpenAI-compatible endpoints).
 
-import std/[asyncdispatch, httpclient, json, net, options, os, strutils, tables, uri]
-import ./[types, config, utf8]
+import std/[asyncdispatch, httpclient, json, monotimes, net, options, os, strutils, tables, times, uri]
+import ./[types, config, utf8, release_info]
 
 type
   ToolSchemaDef* = object
@@ -59,8 +59,6 @@ type
 
 # Default real-time SSE / HTTP line transport backed by AsyncHttpClient
 
-var activeStreamIdleTick*: proc() {.closure.} = nil
-
 proc streamHttpAsync(
   url: string,
   httpMethod: string,
@@ -83,7 +81,7 @@ proc streamHttpAsync(
   for k, v in headers.pairs:
     hdrs[k] = v
 
-  let client = newAsyncHttpClient(userAgent = "ni-coding-agent/0.2.0", proxy = proxy)
+  let client = newAsyncHttpClient(userAgent = "ni-coding-agent/" & NiVersion, proxy = proxy)
   defer:
     client.close()
 
@@ -95,13 +93,11 @@ proc streamHttpAsync(
   let reqFut = client.request(url, httpMethod = meth, body = body, headers = hdrs)
   var waitedReqMs = 0
   while not reqFut.finished:
-    if not abort.isNil and abort.aborted:
+    if abort.pollAbort():
       return HttpStreamResponse(statusCode: 499, headers: initTable[string, string](), errorBody: "Aborted")
     let done = await withTimeout(reqFut, 80)
     if not done:
       waitedReqMs += 80
-      if not activeStreamIdleTick.isNil:
-        activeStreamIdleTick()
       if timeoutMs > 0 and waitedReqMs >= timeoutMs:
         raise newException(IOError, "HTTP request timeout exceeded (" & $timeoutMs & " ms)")
 
@@ -114,23 +110,28 @@ proc streamHttpAsync(
         respHeaders[k.toLowerAscii()] = v.join(", ")
 
   if code < 200 or code >= 300:
-    let errText = await resp.bodyStream.readAll()
-    return HttpStreamResponse(statusCode: code, headers: respHeaders, errorBody: errText)
+    let bodyFuture = resp.bodyStream.readAll()
+    let start = getMonoTime()
+    while not bodyFuture.finished:
+      if abort.pollAbort():
+        return HttpStreamResponse(statusCode: 499, headers: respHeaders, errorBody: "Aborted")
+      if timeoutMs > 0 and (getMonoTime() - start).inMilliseconds >= timeoutMs:
+        raise newException(IOError, "HTTP error body timeout exceeded")
+      discard await withTimeout(bodyFuture, 80)
+    return HttpStreamResponse(statusCode: code, headers: respHeaders, errorBody: bodyFuture.read())
 
   var pending = ""
   while true:
-    if not abort.isNil and abort.aborted:
+    if abort.pollAbort():
       break
     let readFut = resp.bodyStream.read()
     var idleMs = 0
     while not readFut.finished:
-      if not abort.isNil and abort.aborted:
+      if abort.pollAbort():
         break
       let done = await withTimeout(readFut, 80)
       if not done:
         idleMs += 80
-        if not activeStreamIdleTick.isNil:
-          activeStreamIdleTick()
         if timeoutMs > 0 and idleMs >= timeoutMs:
           raise newException(IOError, "HTTP stream idle timeout exceeded (" & $timeoutMs & " ms)")
     if not abort.isNil and abort.aborted:
@@ -140,8 +141,6 @@ proc streamHttpAsync(
       break
     if not abort.isNil and abort.aborted:
       break
-    if not activeStreamIdleTick.isNil:
-      activeStreamIdleTick()
     pending.add(chunk)
     var startIdx = 0
     for i in 0 ..< pending.len:
@@ -460,11 +459,6 @@ proc parseToolArgumentsJson(raw: string): JsonNode =
   except CatchableError:
     return %*{ "_raw": raw }
 
-proc encodeProviderBody(body: JsonNode): string =
-  # Nim's JSON serializer emits string bytes verbatim after escaping JSON syntax.
-  # Tool output and old session entries can contain malformed UTF-8.
-  replaceInvalidUtf8($body)
-
 proc formatHttpError(providerId: string, status: int, body: string): string =
   var detail = body.strip()
   try:
@@ -593,7 +587,7 @@ proc openAICompletionsAdapter*(
   var httpResp: HttpStreamResponse
   try:
     httpResp = transport(
-      url, "POST", headers, encodeProviderBody(bodyJson), req.proxyUrl, req.timeoutMs, abort,
+      url, "POST", headers, encodeJsonUtf8(bodyJson), req.proxyUrl, req.timeoutMs, abort,
       proc(line: string) =
         let trimmed = line.strip()
         if trimmed.len == 0 or trimmed.startsWith(":"):
@@ -684,10 +678,10 @@ proc openAICompletionsAdapter*(
   computeCost(req.model.cost, usage)
 
   let finalReason =
-    if partialCalls.len > 0 or finishReason == "tool_calls":
-      srToolUse
-    elif finishReason == "length":
+    if finishReason == "length":
       srLength
+    elif partialCalls.len > 0 or finishReason == "tool_calls":
+      srToolUse
     else:
       srStop
 
@@ -806,11 +800,12 @@ proc openAIResponsesAdapter*(
   var itemOrder: seq[string] = @[]
   var usage = Usage()
   var streamErr = ""
+  var outputTruncated = false
 
   var httpResp: HttpStreamResponse
   try:
     httpResp = transport(
-      url, "POST", headers, encodeProviderBody(bodyJson), req.proxyUrl, req.timeoutMs, abort,
+      url, "POST", headers, encodeJsonUtf8(bodyJson), req.proxyUrl, req.timeoutMs, abort,
       proc(line: string) =
         if not line.startsWith("data:"):
           return
@@ -869,8 +864,14 @@ proc openAIResponsesAdapter*(
             if itemId notin callsByItem:
               itemOrder.add(itemId)
             callsByItem[itemId] = pc
-        of "response.completed":
+        of "response.completed", "response.incomplete":
           let respObj = ev{"response"}
+          if evType == "response.incomplete":
+            let reason = respObj{"incomplete_details"}{"reason"}.getStr("unknown reason")
+            if reason == "max_output_tokens":
+              outputTruncated = true
+            else:
+              streamErr = "Responses stream incomplete: " & reason
           if not respObj.isNil and respObj.kind == JObject and respObj.hasKey("usage"):
             let u = respObj["usage"]
             usage.inputTokens = u{"input_tokens"}.getInt(0)
@@ -931,7 +932,7 @@ proc openAIResponsesAdapter*(
       onEvent(StreamEvent(kind: sekToolCallEnd, endIndex: idx, finishedCall: tc))
 
   computeCost(req.model.cost, usage)
-  let sr = if itemOrder.len > 0: srToolUse else: srStop
+  let sr = if outputTruncated: srLength elif itemOrder.len > 0: srToolUse else: srStop
   if not onEvent.isNil:
     onEvent(StreamEvent(kind: sekDone, stopReason: sr, usage: usage))
 
@@ -1199,7 +1200,7 @@ proc anthropicMessagesAdapter*(
   var httpResp: HttpStreamResponse
   try:
     httpResp = transport(
-      url, "POST", headers, encodeProviderBody(bodyJson), req.proxyUrl, req.timeoutMs, abort,
+      url, "POST", headers, encodeJsonUtf8(bodyJson), req.proxyUrl, req.timeoutMs, abort,
       proc(line: string) =
         if not line.startsWith("data:"):
           return
@@ -1338,10 +1339,10 @@ proc anthropicMessagesAdapter*(
       discard
 
   computeCost(req.model.cost, usage)
-  let sr = if sawToolCall or stopReasonRaw == "tool_use":
-    srToolUse
-  elif stopReasonRaw == "max_tokens":
+  let sr = if stopReasonRaw == "max_tokens":
     srLength
+  elif sawToolCall or stopReasonRaw == "tool_use":
+    srToolUse
   else:
     srStop
 
@@ -1563,7 +1564,7 @@ proc googleGenerativeAIAdapter*(
   var httpResp: HttpStreamResponse
   try:
     httpResp = transport(
-      url, "POST", headers, encodeProviderBody(bodyJson), req.proxyUrl, req.timeoutMs, abort,
+      url, "POST", headers, encodeJsonUtf8(bodyJson), req.proxyUrl, req.timeoutMs, abort,
       proc(line: string) =
         if not line.startsWith("data:"):
           return
@@ -1668,10 +1669,10 @@ proc googleGenerativeAIAdapter*(
 
   computeCost(req.model.cost, usage)
   let hasToolCalls = collectToolCalls(blocks).len > 0
-  let sr = if hasToolCalls:
-    srToolUse
-  elif finishReasonRaw == "MAX_TOKENS":
+  let sr = if finishReasonRaw == "MAX_TOKENS":
     srLength
+  elif hasToolCalls:
+    srToolUse
   else:
     srStop
 
@@ -2295,23 +2296,40 @@ proc streamCompletion*(
     timeoutMs: cfg.settings.httpIdleTimeoutMs
   )
 
-  let prevTick = activeStreamIdleTick
-  activeStreamIdleTick = reg.onIdleTick
+  let runAbort = if abort.isNil: newAbortFlag() else: abort
+  let prevTick = runAbort.onIdle
+  if prevTick.isNil:
+    runAbort.onIdle = reg.onIdleTick
   defer:
-    activeStreamIdleTick = prevTick
+    runAbort.onIdle = prevTick
 
   let maxAttempts = if cfg.settings.retry.enabled: max(1, cfg.settings.retry.maxRetries + 1) else: 1
   var attempt = 0
+  proc finishRetry(msg: AgentMessage): AgentMessage =
+    if attempt > 1 and not onEvent.isNil:
+      onEvent(StreamEvent(kind: sekRetryEnd, retryAttempt: attempt,
+        retryError: (if msg.stopReason in {srError, srAborted}: msg.errorMessage else: "")))
+    msg
   while attempt < maxAttempts:
     inc attempt
-    let msg = adapter(req, reg.transport, onEvent, abort)
-    if msg.stopReason != srError or (not abort.isNil and abort.aborted):
-      return msg
+    if runAbort.pollAbort():
+      return finishRetry(AgentMessage(role: mrAssistant, provider: model.provider, model: model.id,
+        stopReason: srAborted, errorMessage: "Request aborted"))
+    let msg = adapter(req, reg.transport, onEvent, runAbort)
+    if msg.stopReason != srError or runAbort.aborted:
+      return finishRetry(msg)
     let isTransient = ("HTTP 429" in msg.errorMessage) or ("HTTP 408" in msg.errorMessage) or
                       ("HTTP 500" in msg.errorMessage) or ("HTTP 502" in msg.errorMessage) or
                       ("HTTP 503" in msg.errorMessage) or ("HTTP 504" in msg.errorMessage) or
                       ("timeout" in msg.errorMessage.toLowerAscii())
     if not isTransient or attempt >= maxAttempts:
-      return msg
-    let delayMs = min(cfg.settings.retry.baseDelayMs * (1 shl (attempt - 1)), cfg.settings.retry.maxDelayMs)
-    sleep(delayMs)
+      return finishRetry(msg)
+    let delayMs = min(cfg.settings.retry.baseDelayMs * (1 shl min(20, attempt - 1)), cfg.settings.retry.maxDelayMs)
+    let deadline = getMonoTime() + initDuration(milliseconds = delayMs)
+    runAbort.retrying = true
+    if not onEvent.isNil:
+      onEvent(StreamEvent(kind: sekRetryStart, retryAttempt: attempt, retryLimit: maxAttempts,
+        retryDelayMs: delayMs, retryError: msg.errorMessage))
+    while getMonoTime() < deadline and not runAbort.pollAbort():
+      sleep(max(1, min(50, (deadline - getMonoTime()).inMilliseconds.int)))
+    runAbort.retrying = false

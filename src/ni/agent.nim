@@ -1,43 +1,68 @@
 # Core multi-turn Agent runtime: @file expansion, context compaction, streaming LLM turns, and tool execution loop.
 
-import std/[base64, json, options, os, strutils]
+import std/[base64, json, monotimes, options, os, strutils, tables, times]
 import ./[types, config, trust, provider, tools, skills, mcp, session, prompt, utf8]
 
 const MaxAgentTurnsPerRun* = 64
 
 type
   AgentEventKind* = enum
+    aekRunStart
     aekTurnStart
     aekStream
+    aekMessage
+    aekAssistantEnd
     aekToolStart
+    aekToolUpdate
     aekToolEnd
+    aekCompactionStart
     aekCompaction
     aekTurnEnd
+    aekQueueUpdate
     aekRunEnd
 
   AgentEvent* = object
     case kind*: AgentEventKind
+    of aekRunStart: discard
     of aekTurnStart:
       turnIndex*: int
       modelId*: string
     of aekStream:
       streamEvent*: StreamEvent
+    of aekMessage:
+      observedMessage*: AgentMessage
     of aekToolStart:
       toolCallId*: string
       toolName*: string
       toolArgs*: JsonNode
+    of aekToolUpdate:
+      updateToolCallId*: string
+      updateToolName*: string
+      updateToolArgs*: JsonNode
+      partialOutput*: string
     of aekToolEnd:
       endToolCallId*: string
       endToolName*: string
       toolOutput*: ToolOutput
-    of aekCompaction:
+      toolDurationMs*: int64
+    of aekCompactionStart, aekCompaction:
       tokensBefore*: int
       summaryText*: string
-    of aekTurnEnd:
+      firstKeptId*: string
+      compactionReason*: string
+      compactionError*: string
+      compactionAborted*: bool
+      estimatedTokensAfter*: int
+      compactionUsage*: Usage
+    of aekAssistantEnd, aekTurnEnd:
       assistantMessage*: AgentMessage
+      turnToolResults*: seq[AgentMessage]
+    of aekQueueUpdate:
+      queuedSteering*, queuedFollowUps*: seq[string]
     of aekRunEnd:
       finalMessage*: AgentMessage
       totalTurns*: int
+      runMessages*: seq[AgentMessage]
 
   AgentEventCallback* = proc(ev: AgentEvent) {.closure.}
 
@@ -49,15 +74,26 @@ type
     text*: string
     images*: seq[ContentBlock]
 
+  RuntimeConfigOverrides* = object
+    noContextFiles*, noSkills*, noPromptTemplates*: bool
+    systemPrompt*: Option[string]
+    securityMode*: Option[SecurityMode]
+    extraSkills*, extraPromptTemplates*: seq[string]
+
   AgentRuntime* = ref object
     cfg*: ConfigBundle
+    configOverrides*: RuntimeConfigOverrides
     providerRegistry*: ProviderRegistry
     toolRegistry*: ToolRegistry
     mcpManager*: McpManager
+    toolOverrides*: seq[seq[string]]
+    noTools*: bool
+    noMcp*: bool
     skills*: seq[Skill]
     promptTemplates*: seq[PromptTemplate]
     security*: SecurityPolicy
     session*: SessionManager
+    sessionsRoot*: string
     currentModel*: ModelConfig
     thinkingLevel*: ThinkingLevel
     cliApiKey*: string
@@ -69,6 +105,25 @@ type
     followUpMode*: QueueMode
     lastAssistantText*: string
     lastDiff*: string
+
+proc loadRuntimeConfig*(cwd, agentDir: string, projectTrusted: bool,
+                        overrides: RuntimeConfigOverrides): ConfigBundle =
+  result = loadConfigBundle(cwd, agentDir, projectTrusted, loadContext = not overrides.noContextFiles)
+  if overrides.systemPrompt.isSome:
+    result.customSystemPrompt = overrides.systemPrompt.get
+  if overrides.securityMode.isSome:
+    result.settings.securityMode = overrides.securityMode.get
+
+proc discoverRuntimeResources*(cfg: ConfigBundle, overrides: RuntimeConfigOverrides): tuple[
+    skills: seq[Skill], templates: seq[PromptTemplate], diagnostics: seq[string]] =
+  let skillPaths = if overrides.noSkills: overrides.extraSkills else: cfg.settings.skills & overrides.extraSkills
+  let promptPaths = if overrides.noPromptTemplates: overrides.extraPromptTemplates
+    else: cfg.settings.prompts & overrides.extraPromptTemplates
+  let (skills, skillDiagnostics) = discoverSkills(cfg.cwd, cfg.agentDir, skillPaths,
+    projectTrusted = cfg.projectTrusted, includeDefaults = not overrides.noSkills)
+  let (templates, templateDiagnostics) = discoverPromptTemplates(cfg.cwd, cfg.agentDir, promptPaths,
+    projectTrusted = cfg.projectTrusted, includeDefaults = not overrides.noPromptTemplates)
+  (skills, templates, skillDiagnostics & templateDiagnostics)
 
 # Prompt preprocessing: `/skill:<name>` expansion and `@filepath` inline file/image attachments
 
@@ -199,9 +254,8 @@ proc renderTranscriptForSummary(entries: openArray[SessionEntry]): string =
       discard
   parts.join("\n\n")
 
-proc compactSession*(rt: AgentRuntime, force = false, onEvent: AgentEventCallback = nil, abort: AbortFlag = nil): Option[string] =
-  ## Summarize older session entries when context approaches model limit or when `/compact` is invoked.
-  let sysPrompt = buildSystemPrompt(PromptBuildInput(
+proc runtimeSystemPrompt*(rt: AgentRuntime): string =
+  buildSystemPrompt(PromptBuildInput(
     cwd: rt.cfg.cwd,
     customSystemPrompt: rt.cfg.customSystemPrompt,
     appendSystemPrompt: rt.cfg.appendSystemPrompt,
@@ -211,44 +265,74 @@ proc compactSession*(rt: AgentRuntime, force = false, onEvent: AgentEventCallbac
     skills: rt.skills,
     mcpManager: rt.mcpManager
   ))
+
+proc compactSession*(rt: AgentRuntime, force = false, onEvent: AgentEventCallback = nil,
+                     abort: AbortFlag = nil, overflow = false, customInstructions = ""): Option[string] =
+  ## Summarize older context, keeping each assistant call and its tool results together.
   let (activeMsgs, _, _) = rt.session.buildActiveContext()
-  if activeMsgs.len < 4 and not force:
+  if activeMsgs.len < 2 or (not force and not rt.cfg.settings.compaction.enabled):
     return none(string)
 
-  let estTokens = estimateContextTokens(sysPrompt, activeMsgs)
+  let estTokens = estimateContextTokens(rt.runtimeSystemPrompt(), activeMsgs)
   let threshold = max(8_000, rt.currentModel.contextWindow - rt.cfg.settings.compaction.reserveTokens)
-  if not force and (not rt.cfg.settings.compaction.enabled or estTokens < threshold):
+  if not force and not overflow and estTokens < threshold:
     return none(string)
 
   let branch = rt.session.activeBranchEntries()
-  if branch.len < 2:
-    return none(string)
+  var firstActive = 0
+  var priorSummary = ""
+  for i in countdown(branch.high, 0):
+    if branch[i].kind == sekCompaction:
+      let previous = branch[i]
+      priorSummary = previous.summary
+      firstActive = i + 1
+      if previous.firstKeptEntryId != previous.id:
+        for j in 0 ..< i:
+          if branch[j].id == previous.firstKeptEntryId:
+            firstActive = j
+            break
+      break
 
-  # Determine split point keeping roughly `keepRecentTokens` of recent messages (or last 2 entries on forced compact)
-  var keptTokens = 0
-  var splitIdx = branch.len
-  let keepBudget = if force: min(4000, rt.cfg.settings.compaction.keepRecentTokens)
-                   else: rt.cfg.settings.compaction.keepRecentTokens
-
-  for i in countdown(branch.high, 1):
-    if branch[i].kind == sekMessage:
-      let mt = estimateMessageTokens(branch[i].message)
-      if keptTokens + mt > keepBudget and splitIdx < branch.len:
-        break
-      keptTokens += mt
-    splitIdx = i
-    # Do not split right between an assistant tool_call and its toolResult!
-    if branch[i].kind == sekMessage and branch[i].message.role == mrToolResult:
+  var entries: seq[SessionEntry]
+  var starts: seq[int]
+  for i in firstActive ..< branch.len:
+    let entry = branch[i]
+    if entry.kind != sekMessage or entry.message.role == mrSystem:
       continue
-
-  if splitIdx <= 0:
-    splitIdx = max(1, branch.len - 2)
-  let toSummarize = branch[0 ..< splitIdx]
-  let transcript = renderTranscriptForSummary(toSummarize)
+    if entry.message.role != mrToolResult:
+      starts.add(entries.len)
+    entries.add(entry)
+  if starts.len < 2:
+    return none(string)
+  let keepBudget = if force: min(4000, rt.cfg.settings.compaction.keepRecentTokens)
+    elif overflow: min(rt.cfg.settings.compaction.keepRecentTokens, max(1, estTokens div 4))
+    else: rt.cfg.settings.compaction.keepRecentTokens
+  var splitIdx = starts[^1]
+  var keptTokens = 0
+  var boundary = entries.len
+  for group in countdown(starts.high, (if force or overflow: 1 else: 0)):
+    let start = starts[group]
+    var tokens = 0
+    for i in start ..< boundary:
+      tokens += estimateMessageTokens(entries[i].message)
+    if group < starts.high and keptTokens + tokens > keepBudget:
+      break
+    keptTokens += tokens
+    splitIdx = start
+    boundary = start
+  if splitIdx == 0:
+    return none(string)
+  var transcript = renderTranscriptForSummary(entries[0 ..< splitIdx])
+  if priorSummary.len > 0:
+    transcript = "[Earlier summary]\n" & priorSummary & "\n\n" & transcript
   if transcript.strip().len == 0:
     return none(string)
 
-  let summaryPrompt = "Summarize the following coding session history concisely so another turn can continue seamlessly. Preserve: (1) user goals & constraints, (2) exact file paths read/modified and key decisions, (3) current progress, errors, and remaining next steps.\n\n<transcript>\n" & transcript & "\n</transcript>"
+  let reason = if overflow: "overflow" elif force: "manual" else: "threshold"
+  if not onEvent.isNil:
+    onEvent(AgentEvent(kind: aekCompactionStart, compactionReason: reason))
+  let extra = if customInstructions.len > 0: "\n\nUser summary instructions:\n" & customInstructions else: ""
+  let summaryPrompt = "Summarize the following coding session history concisely so another turn can continue seamlessly. Preserve: (1) user goals & constraints, (2) exact file paths read/modified and key decisions, (3) current progress, errors, and remaining next steps." & extra & "\n\n<transcript>\n" & transcript & "\n</transcript>"
   let resp = rt.providerRegistry.streamCompletion(
     cfg = rt.cfg,
     model = rt.currentModel,
@@ -260,20 +344,71 @@ proc compactSession*(rt: AgentRuntime, force = false, onEvent: AgentEventCallbac
     onEvent = nil,
     abort = abort
   )
-  if resp.stopReason == srError or resp.stopReason == srAborted:
-    return none(string)
-
   let summaryText = collectText(resp.assistantBlocks).strip()
-  if summaryText.len == 0:
+  if resp.stopReason in {srError, srAborted, srLength} or summaryText.len == 0:
+    if not onEvent.isNil:
+      onEvent(AgentEvent(kind: aekCompaction, compactionReason: reason, compactionAborted: resp.stopReason == srAborted,
+        compactionError: resp.errorMessage))
     return none(string)
 
-  let firstKeptId = if splitIdx < branch.len: branch[splitIdx].id else: ""
+  let firstKeptId = entries[splitIdx].id
   discard rt.session.appendCompaction(summaryText, firstKeptId, estTokens)
   if not onEvent.isNil:
-    onEvent(AgentEvent(kind: aekCompaction, tokensBefore: estTokens, summaryText: summaryText))
+    let (kept, _, _) = rt.session.buildActiveContext()
+    onEvent(AgentEvent(kind: aekCompaction, tokensBefore: estTokens, summaryText: summaryText,
+      firstKeptId: firstKeptId, compactionReason: reason,
+      estimatedTokensAfter: estimateContextTokens(rt.runtimeSystemPrompt(), kept), compactionUsage: resp.usage))
   some(summaryText)
 
+proc contextOverflow(msg: AgentMessage): bool =
+  if msg.stopReason == srLength:
+    return true
+  if msg.stopReason != srError:
+    return false
+  let detail = msg.errorMessage.toLowerAscii()
+  for phrase in ["context_length_exceeded", "context window", "context length", "context limit",
+                 "prompt is too long", "input is too long", "too many input tokens", "input token count", "context overflow"]:
+    if phrase in detail:
+      return true
+  false
+
 # Main Agent Run Loop
+
+proc restoreSessionState*(rt: AgentRuntime, keepModel = false, keepThinking = false) =
+  let (_, selectedModel, selectedThinking) = rt.session.buildActiveContext()
+  var savedModel = selectedModel
+  var savedThinking = selectedThinking
+  rt.lastAssistantText = ""
+  rt.lastDiff = ""
+  let entries = rt.session.activeBranchEntries()
+  for i in countdown(entries.high, 0):
+    if entries[i].kind != sekMessage: continue
+    let msg = entries[i].message
+    if msg.role == mrAssistant:
+      if savedModel.isNone and msg.provider.len > 0 and msg.model.len > 0:
+        savedModel = some((provider: msg.provider, modelId: msg.model))
+      if savedThinking.isNone and msg.model.len > 0:
+        savedThinking = some(msg.thinkingLevel)
+      if rt.lastAssistantText.len == 0:
+        rt.lastAssistantText = collectText(msg.assistantBlocks)
+    elif msg.role == mrToolResult and rt.lastDiff.len == 0:
+      rt.lastDiff = msg.diff
+  if not keepModel and savedModel.isSome:
+    let (provider, id) = savedModel.get
+    if rt.providerRegistry.providers.hasKey(provider):
+      for model in rt.providerRegistry.providers[provider].models:
+        if model.id == id:
+          rt.currentModel = model
+          break
+  if not keepThinking:
+    rt.thinkingLevel = savedThinking.get(rt.thinkingLevel)
+  rt.thinkingLevel = clampThinkingLevel(rt.currentModel, rt.thinkingLevel)
+
+proc switchSession*(rt: AgentRuntime, session: SessionManager) =
+  if rt.session != session:
+    rt.session.close()
+    rt.session = session
+  rt.restoreSessionState()
 
 proc newAgentRuntime*(
   cfg: ConfigBundle,
@@ -288,22 +423,12 @@ proc newAgentRuntime*(
   cliApiKey = "",
   cliAppendPrompts: seq[string] = @[],
   askQuestion: AskQuestionCallback = nil,
-  promptTemplates: seq[PromptTemplate] = @[]
+  promptTemplates: seq[PromptTemplate] = @[],
+  keepModel = false,
+  keepThinking = false
 ): AgentRuntime =
   ## Wire together all subsystems into a ready-to-run AgentRuntime.
-  var model = initialModel
-  var tlevel = thinkingLevel
-
-  # Restore session-saved model & thinking level when resuming an existing session
-  let (_, savedModel, savedThinking) = session.buildActiveContext()
-  if savedModel.isSome:
-    let (prov, mid) = savedModel.get
-    let (resolved, _) = providerRegistry.resolveModel(cfg, mid, prov, cliApiKey)
-    model = resolved
-  if savedThinking.isSome:
-    tlevel = savedThinking.get
-
-  AgentRuntime(
+  result = AgentRuntime(
     cfg: cfg,
     providerRegistry: providerRegistry,
     toolRegistry: toolRegistry,
@@ -312,8 +437,9 @@ proc newAgentRuntime*(
     promptTemplates: promptTemplates,
     security: security,
     session: session,
-    currentModel: model,
-    thinkingLevel: tlevel,
+    sessionsRoot: resolveSessionsRoot(cfg),
+    currentModel: initialModel,
+    thinkingLevel: thinkingLevel,
     cliApiKey: cliApiKey,
     cliAppendPrompts: cliAppendPrompts,
     askQuestion: askQuestion,
@@ -322,6 +448,7 @@ proc newAgentRuntime*(
     lastAssistantText: "",
     lastDiff: ""
   )
+  result.restoreSessionState(keepModel, keepThinking)
 
 proc switchModel*(rt: AgentRuntime, newModel: ModelConfig) =
   ## Switch active model and record ModelChangeEntry in session history.
@@ -333,17 +460,31 @@ proc switchThinkingLevel*(rt: AgentRuntime, level: ThinkingLevel) =
   rt.thinkingLevel = level
   rt.session.appendThinkingChange(level)
 
-proc appendQueuedPrompts(rt: AgentRuntime, queue: var seq[QueuedPrompt], mode: QueueMode): bool =
+proc emitQueueUpdate*(rt: AgentRuntime, onEvent: AgentEventCallback) =
+  if not onEvent.isNil:
+    var ev = AgentEvent(kind: aekQueueUpdate)
+    for prompt in rt.steeringQueue: ev.queuedSteering.add(prompt.text)
+    for prompt in rt.followUpQueue: ev.queuedFollowUps.add(prompt.text)
+    onEvent(ev)
+
+proc appendObservedMessage(rt: AgentRuntime, msg: AgentMessage, onEvent: AgentEventCallback) =
+  discard rt.session.appendMessage(msg)
+  if not onEvent.isNil:
+    onEvent(AgentEvent(kind: aekMessage, observedMessage: msg))
+
+proc appendQueuedPrompts(rt: AgentRuntime, queue: var seq[QueuedPrompt], mode: QueueMode,
+                         onEvent: AgentEventCallback): bool =
   if queue.len == 0:
     return false
   let count = if mode == qmAll: queue.len else: 1
   for i in 0 ..< count:
     let prompt = queue[i]
-    discard rt.session.appendMessage(rt.buildUserPromptMessage(prompt.text, extraImages = prompt.images))
+    rt.appendObservedMessage(rt.buildUserPromptMessage(prompt.text, extraImages = prompt.images), onEvent)
   if mode == qmAll:
     queue.setLen(0)
   else:
     queue.delete(0)
+  rt.emitQueueUpdate(onEvent)
   true
 
 proc runPrompt*(
@@ -356,53 +497,63 @@ proc runPrompt*(
 ): AgentMessage =
   ## Submit a user prompt and run the agent tool-calling loop to completion.
   let turnAbort = if abort.isNil: newAbortFlag() else: abort
+  let previousIdle = turnAbort.onIdle
+  if previousIdle.isNil:
+    turnAbort.onIdle = rt.providerRegistry.onIdleTick
+  defer: turnAbort.onIdle = previousIdle
+  let firstNewEntry = rt.session.entries.len
+  if not onEvent.isNil:
+    onEvent(AgentEvent(kind: aekRunStart))
   let userMsg = rt.buildUserPromptMessage(rawPrompt, explicitFiles, extraImages)
-  discard rt.session.appendMessage(userMsg)
+  rt.appendObservedMessage(userMsg, onEvent)
 
   var turns = 0
   var lastAssistant = AgentMessage(role: mrAssistant, timestampMs: nowUnixMs(), stopReason: srStop)
 
-  while turns < MaxAgentTurnsPerRun:
+  while true:
     if turnAbort.aborted:
       lastAssistant.stopReason = srAborted
+      break
+    if turns == MaxAgentTurnsPerRun:
+      lastAssistant.stopReason = srTurnLimit
       break
 
     inc turns
     discard rt.compactSession(force = false, onEvent = onEvent, abort = turnAbort)
 
-    let sysPrompt = buildSystemPrompt(PromptBuildInput(
-      cwd: rt.cfg.cwd,
-      customSystemPrompt: rt.cfg.customSystemPrompt,
-      appendSystemPrompt: rt.cfg.appendSystemPrompt,
-      cliAppendPrompts: rt.cliAppendPrompts,
-      contextFiles: rt.cfg.contextFiles,
-      toolRegistry: rt.toolRegistry,
-      skills: rt.skills,
-      mcpManager: rt.mcpManager
-    ))
-
-    let (historyMsgs, _, _) = rt.session.buildActiveContext()
+    let sysPrompt = rt.runtimeSystemPrompt()
     let toolSchemas = rt.toolRegistry.declaredToolSchemas()
 
-    if not onEvent.isNil:
-      onEvent(AgentEvent(kind: aekTurnStart, turnIndex: turns, modelId: rt.currentModel.id))
     if turnAbort.aborted:
       lastAssistant.stopReason = srAborted
       break
 
-    let assistantMsg = rt.providerRegistry.streamCompletion(
-      cfg = rt.cfg,
-      model = rt.currentModel,
-      systemPrompt = sysPrompt,
-      messages = historyMsgs,
-      tools = toolSchemas,
-      thinkingLevel = rt.thinkingLevel,
-      cliApiKey = rt.cliApiKey,
-      onEvent = proc(sev: StreamEvent) =
+    var assistantMsg: AgentMessage
+    for attempt in 0..1:
+      let (historyMsgs, _, _) = rt.session.buildActiveContext()
+      if not onEvent.isNil:
+        onEvent(AgentEvent(kind: aekTurnStart, turnIndex: turns, modelId: rt.currentModel.id))
+      assistantMsg = rt.providerRegistry.streamCompletion(
+        cfg = rt.cfg, model = rt.currentModel, systemPrompt = sysPrompt, messages = historyMsgs,
+        tools = toolSchemas, thinkingLevel = rt.thinkingLevel, cliApiKey = rt.cliApiKey,
+        onEvent = proc(sev: StreamEvent) =
+          if not onEvent.isNil:
+            onEvent(AgentEvent(kind: aekStream, streamEvent: sev)),
+        abort = turnAbort)
+      if attempt == 0 and not turnAbort.aborted and contextOverflow(assistantMsg) and
+          rt.compactSession(onEvent = onEvent, abort = turnAbort, overflow = true).isSome:
         if not onEvent.isNil:
-          onEvent(AgentEvent(kind: aekStream, streamEvent: sev)),
-      abort = turnAbort
-    )
+          onEvent(AgentEvent(kind: aekAssistantEnd, assistantMessage: assistantMsg))
+        continue
+      break
+
+    if turnAbort.aborted:
+      assistantMsg.stopReason = srAborted
+    if assistantMsg.stopReason in {srLength, srError, srAborted}:
+      var complete: seq[ContentBlock]
+      for blockItem in assistantMsg.assistantBlocks:
+        if blockItem.kind != ckToolCall: complete.add(blockItem)
+      assistantMsg.assistantBlocks = complete
 
     lastAssistant = assistantMsg
     let txt = collectText(assistantMsg.assistantBlocks)
@@ -414,20 +565,26 @@ proc runPrompt*(
       discard rt.session.appendMessage(assistantMsg)
 
     if not onEvent.isNil:
-      onEvent(AgentEvent(kind: aekTurnEnd, assistantMessage: assistantMsg))
+      onEvent(AgentEvent(kind: aekAssistantEnd, assistantMessage: assistantMsg))
 
-    if assistantMsg.stopReason in {srError, srAborted}:
+    if assistantMsg.stopReason in {srError, srAborted, srLength}:
+      if not onEvent.isNil:
+        onEvent(AgentEvent(kind: aekTurnEnd, assistantMessage: assistantMsg))
       break
 
     let toolCalls = collectToolCalls(assistantMsg.assistantBlocks)
     if toolCalls.len == 0:
+      if not onEvent.isNil:
+        onEvent(AgentEvent(kind: aekTurnEnd, assistantMessage: assistantMsg))
       if turnAbort.aborted:
         lastAssistant.stopReason = srAborted
         break
-      if rt.appendQueuedPrompts(rt.steeringQueue, rt.steeringMode) or
-          rt.appendQueuedPrompts(rt.followUpQueue, rt.followUpMode):
-        continue
-      break
+      if rt.steeringQueue.len == 0 and rt.followUpQueue.len == 0:
+        break
+      if turns < MaxAgentTurnsPerRun:
+        discard rt.appendQueuedPrompts(rt.steeringQueue, rt.steeringMode, onEvent) or
+          rt.appendQueuedPrompts(rt.followUpQueue, rt.followUpMode, onEvent)
+      continue
 
     let toolCtx = ToolContext(
       cwd: rt.cfg.cwd,
@@ -439,27 +596,51 @@ proc runPrompt*(
       modelId: rt.currentModel.provider & "/" & rt.currentModel.id
     )
 
+    var toolResults: seq[AgentMessage]
     for tc in toolCalls:
       if turnAbort.aborted:
         let abortedOut = ToolOutput(content: @[textBlock("Tool execution cancelled by user")], isError: true)
-        discard rt.session.appendMessage(newToolResultMessage(tc.id, tc.name, abortedOut))
+        let toolMessage = newToolResultMessage(tc.id, tc.name, abortedOut)
+        toolResults.add(toolMessage)
+        rt.appendObservedMessage(toolMessage, onEvent)
         continue
 
       if not onEvent.isNil:
         onEvent(AgentEvent(kind: aekToolStart, toolCallId: tc.id, toolName: tc.name, toolArgs: tc.arguments))
+        let id = tc.id
+        let name = tc.name
+        let args = tc.arguments
+        var partial = ""
+        toolCtx.onOutput = proc(delta: string) =
+          if partial.len < DefaultMaxBytes:
+            partial.add(delta[0 ..< utf8BoundaryBefore(delta, min(delta.len, DefaultMaxBytes - partial.len))])
+            onEvent(AgentEvent(kind: aekToolUpdate, updateToolCallId: id, updateToolName: name,
+              updateToolArgs: args, partialOutput: partial))
 
+      let toolStarted = getMonoTime()
       let outp = rt.toolRegistry.invokeTool(tc.name, tc.arguments, toolCtx)
       if outp.diff.len > 0:
         rt.lastDiff = outp.diff
 
       if not onEvent.isNil:
-        onEvent(AgentEvent(kind: aekToolEnd, endToolCallId: tc.id, endToolName: tc.name, toolOutput: outp))
+        onEvent(AgentEvent(kind: aekToolEnd, endToolCallId: tc.id, endToolName: tc.name, toolOutput: outp,
+          toolDurationMs: (getMonoTime() - toolStarted).inMilliseconds))
 
-      discard rt.session.appendMessage(newToolResultMessage(tc.id, tc.name, outp))
+      let toolMessage = newToolResultMessage(tc.id, tc.name, outp)
+      toolResults.add(toolMessage)
+      rt.appendObservedMessage(toolMessage, onEvent)
 
-    if not turnAbort.aborted:
-      discard rt.appendQueuedPrompts(rt.steeringQueue, rt.steeringMode)
+    if not onEvent.isNil:
+      onEvent(AgentEvent(kind: aekTurnEnd, assistantMessage: assistantMsg, turnToolResults: toolResults))
+    if not turnAbort.aborted and turns < MaxAgentTurnsPerRun:
+      discard rt.appendQueuedPrompts(rt.steeringQueue, rt.steeringMode, onEvent)
 
+  if turnAbort.aborted:
+    lastAssistant.stopReason = srAborted
   if not onEvent.isNil:
-    onEvent(AgentEvent(kind: aekRunEnd, finalMessage: lastAssistant, totalTurns: turns))
+    var messages: seq[AgentMessage]
+    for i in firstNewEntry ..< rt.session.entries.len:
+      let entry = rt.session.entries[i]
+      if entry.kind == sekMessage: messages.add(entry.message)
+    onEvent(AgentEvent(kind: aekRunEnd, finalMessage: lastAssistant, totalTurns: turns, runMessages: messages))
   lastAssistant

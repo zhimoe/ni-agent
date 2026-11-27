@@ -238,6 +238,15 @@ proc greet*(name: string): int =
     check sawHighlightedProc
 
 suite "Fixed-layout transcript viewport (pinned dock, scrollback, sticky headers)":
+  test "Frame rows keep styling and links while discarding terminal operations":
+    let noisy = "a\x1b[2Jb\x1b[?2026lc\x1b]0;title\x07d\x1bPpayload\x1b\\e\t\r\nf"
+    check fitScreenRow(noisy, 20) == "abcde    f"
+    check fitScreenRow("\x1b[31m中文", 20) == "\x1b[31m中文\x1b[0m"
+    check fitScreenRow("\x1b]8;;https://example.com\x1b\\link", 20) ==
+      "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x07"
+    check fitScreenRow("\x1b]8;;bad\xC2\x9Ctitle\x07link", 20) == "link"
+    check visibleWidth(fitScreenRow("\x1b[31m中文", 3)) == 2
+
   test "Transcript pins the owning message header while scrolled":
     let prevColors = colorsActive()
     setColorsEnabled(true)
@@ -254,11 +263,12 @@ suite "Fixed-layout transcript viewport (pinned dock, scrollback, sticky headers
       t.addLines(["a" & $i])
     check t.totalLines() == 43
 
-    # Following the live tail: no pinned header, newest rows visible.
+    # Following the live tail keeps the same header row when the message is clipped.
     check t.atBottom()
     let bottom = t.renderHistory(60, 10)
     check bottom.len == 10
-    check "lines above" notin stripAnsi(bottom[0])
+    check "assistant" in stripAnsi(bottom[0])
+    check "End" notin stripAnsi(bottom[0])
     check "a29" in stripAnsi(bottom[^1])
 
     # Scrolled into the assistant message: its header is pinned on the first row.
@@ -281,13 +291,51 @@ suite "Fixed-layout transcript viewport (pinned dock, scrollback, sticky headers
 
     # Clamped at both ends and recoverable with End.
     t.scrollBy(10_000)
-    check t.scrollUp == t.totalLines() - 1
+    check t.scrollUp == t.totalLines() - 10
+    let top = t.renderHistory(60, 10)
+    check top[0] == "banner 1"
+    check top[^1] == "q6"
+    t.scrollBy(3)
+    check t.renderHistory(60, 10) == top
+    t.scrollBy(-3)
+    check t.renderHistory(60, 10) != top
     t.scrollToBottom()
     check t.atBottom()
     check "a29" in stripAnsi(t.renderHistory(60, 10)[^1])
 
     for row in scrolled:
       check visibleWidth(row) <= 60
+
+  test "History stays filled at the top when the viewport grows":
+    let t = newTranscript()
+    for i in 0 ..< 20:
+      t.addLines(["line " & $i])
+    discard t.renderHistory(60, 5)
+    t.scrollToTop()
+    check t.renderHistory(60, 5)[^1] == "line 4"
+
+    let taller = t.renderHistory(60, 8)
+    check taller[0] == "line 0"
+    check taller[^1] == "line 7"
+    check t.scrollUp == 12
+
+    let allHistory = t.renderHistory(60, 24)
+    t.scrollBy(3)
+    check t.atBottom()
+    check t.renderHistory(60, 24) == allHistory
+
+  test "Sticky headers fit narrow terminals and leave room for transcript text":
+    let t = newTranscript()
+    discard t.beginSegment(segAssistant, "model")
+    for i in 0 ..< 20:
+      t.addLines(["line " & $i])
+    discard t.renderHistory(19, 4)
+    t.scrollBy(3)
+    let frame = t.renderHistory(19, 4)
+    check "assistant" in stripAnsi(frame[0])
+    check visibleWidth(frame[0]) <= 19
+    check frame[^1] == "line 16"
+    check t.renderHistory(19, 1) == @["line 16"]
 
   test "New rows keep a scrolled-up view anchored instead of yanking it to the tail":
     let t = newTranscript()
@@ -325,12 +373,53 @@ suite "Fixed-layout transcript viewport (pinned dock, scrollback, sticky headers
     for row in frame:
       check visibleWidth(row) <= 69
 
+    var active = status
+    active.workingStatus = "• Thinking (15s · Esc to interrupt)"
+    active.totalTokens = 1200
+    let working = t.composeScreen(ed, active, 70, 16)
+    check working.len == frame.len
+    check stripAnsi(working[^5]).strip() == active.workingStatus
+    check working[^4 .. ^2] == frame[^4 .. ^2]
+    check "1.2k tok" in stripAnsi(working[^1])
+    check "transcript 39" in stripAnsi(working[^6])
+    let short = t.composeScreen(ed, active, 22, 6)
+    check short.len == 6
+    check "draft prompt" in stripAnsi(short[^3])
+    check "1.2k tok" in stripAnsi(short[^1])
+
   test "paintDiff only repaints changed rows":
     let frame = @["alpha", "beta", "gamma"]
     check paintDiff(frame, frame) == ""
     check paintDiff(@["alpha", "BETA", "gamma"], frame) == "\x1b[2;1Hbeta\x1b[K"
     check paintDiff(@["alpha"], frame) == "\x1b[1;1Halpha\x1b[K\x1b[2;1Hbeta\x1b[K\x1b[3;1Hgamma\x1b[K"
     check paintDiff(frame, frame, fullRepaint = true).count("\x1b[") == 6
+
+  test "paintDiff shifts matching history rows while leaving the dock in place":
+    let before = @["header", "one", "two", "three", "four", "five", "dock"]
+    let after = @["header", "two", "three", "four", "five", "six", "dock"]
+    check paintDiff(before, after, historyRows = 6, scrollRows = 1) ==
+      "\x1b[0m\x1b[2;6r\x1b[1S\x1b[r\x1b[6;1Hsix\x1b[K"
+    check paintDiff(after, before, historyRows = 6, scrollRows = -1) ==
+      "\x1b[0m\x1b[2;6r\x1b[1T\x1b[r\x1b[2;1Hone\x1b[K"
+    var edited = after
+    edited[2] = "different"
+    check paintDiff(before, edited, historyRows = 6, scrollRows = 1) ==
+      paintDiff(before, edited)
+    let repeated = @["header", "same", "same", "same", "same", "same", "dock"]
+    check paintDiff(repeated, repeated, historyRows = 6, scrollRows = 1) == ""
+
+  when defined(posix):
+    test "PTY repaint preserves the final page and coalesces streaming updates":
+      let pythonExe = findExe("python3")
+      let root = getCurrentDir()
+      let niBin = root / addFileExt("ni", ExeExt)
+      if pythonExe.len == 0 or not fileExists(niBin):
+        echo "  (Skipping TUI scroll test: requires python3 and compiled ./ni)"
+      else:
+        let script = root / "tests" / "check_tui_scroll.py"
+        let (output, status) = execCmdEx(quoteShellCommand([pythonExe, script, niBin]))
+        if status != 0: echo output
+        check status == 0
 
 suite "Native Anthropic & Gemini Streaming Providers, Prompt Templates, Fuzzy Edit, and RPC":
   test "Anthropic Messages (/v1/messages) SSE streaming, prompt caching, merged tool_result, and signature replay":
@@ -667,6 +756,10 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       check sawAgentEnd
       check sawLastText
       check sawTree
+      check "\"type\":\"message_start\"" in rpcOut
+      check "\"type\":\"message_update\"" in rpcOut
+      check "\"type\":\"message_end\"" in rpcOut
+      check "\"type\":\"agent_settled\"" in rpcOut
 
       let liveRpc = startProcess(
         niBin,
@@ -704,6 +797,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
         if event{"type"}.getStr() == "agent_end":
           endedAt = i
           check event["stopReason"].getStr() == "aborted"
+          check event["exitCode"].getInt() == 130
         let id = event{"id"}.getStr()
         if id.len > 0:
           responses[id] = event
@@ -717,6 +811,27 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       check responses["clear"]["data"]["followUp"] == %*["next question"]
       check responses["abort"]["success"].getBool()
       check endedAt >= 0 and abortAt > endedAt
+
+      let bashRpc = startProcess(niBin, workingDir = ws, args = @["--mode", "rpc", "--no-session",
+        "--no-mcp", "--agent-dir", agentDir], options = {poUsePath})
+      defer: bashRpc.close()
+      bashRpc.inputStream.writeLine($(%*{"id": "shell", "type": "bash", "command": "printf '\\360'; sleep 15"}))
+      bashRpc.inputStream.flush()
+      sleep(200)
+      bashRpc.inputStream.writeLine("""{"id":"stop-shell","type":"abort_bash"}""")
+      bashRpc.inputStream.close()
+      let bashRecords = bashRpc.outputStream.readAll().strip().splitLines()
+      check bashRpc.waitForExit(2000) == 0
+      var sawValidDelta, sawCancelled = false
+      for line in bashRecords:
+        let event = parseJson(line)
+        if event{"type"}.getStr() == "bash_execution_update":
+          check event["delta"].getStr() == "�"
+          sawValidDelta = true
+        if event{"command"}.getStr() == "bash":
+          check event["data"]["output"].getStr() == "�"
+          sawCancelled = event["data"]["cancelled"].getBool()
+      check sawValidDelta and sawCancelled
 
   test "RPC reads Pi session branches, labels, and append-order cursors":
     let niBin = getCurrentDir() / addFileExt("ni", ExeExt)
@@ -784,3 +899,50 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
     check children[0]["label"] == %"Start here"
     check children[0]["labelTimestamp"] == %"2026-01-01T00:00:03.000Z"
     check children[1]["entry"] == all["entries"][1]
+
+  test "RPC session stats count saved branches and report post-compaction context availability":
+    let niBin = getCurrentDir() / addFileExt("ni", ExeExt)
+    require fileExists(niBin)
+    let root = getTempDir() / ("ni_rpc_stats_" & $nowUnixMs())
+    createDir(root)
+    defer: removeDir(root)
+    let sess = newSessionManager(root, root / "sessions")
+    let kept = sess.appendMessage(newUserMessage("Read note"))
+    discard sess.appendMessage(AgentMessage(role: mrAssistant, stopReason: srToolUse,
+      assistantBlocks: @[toolCallBlock("call_1", "read", %*{"path": "note.txt"})],
+      usage: Usage(inputTokens: 12, outputTokens: 3, totalTokens: 15)))
+    discard sess.appendMessage(newToolResultMessage("call_1", "read",
+      ToolOutput(content: @[textBlock("Note text")])))
+    let compacted = sess.appendCompaction("Earlier context", kept, 100)
+    discard sess.appendMessage(AgentMessage(role: mrAssistant,
+      assistantBlocks: @[textBlock("Finished")],
+      usage: Usage(inputTokens: 8, outputTokens: 2, totalTokens: 10)))
+
+    proc getStats(): JsonNode =
+      let rpc = startProcess(niBin, workingDir = root, args = @[
+        "--mode", "rpc", "--no-mcp", "--no-session", "--session", sess.filePath, "--agent-dir", root / "agent"
+      ], options = {poUsePath})
+      defer: rpc.close()
+      rpc.inputStream.writeLine("""{"id":"stats","type":"get_session_stats"}""")
+      rpc.inputStream.close()
+      let response = parseJson(rpc.outputStream.readAll().strip())
+      check rpc.waitForExit() == 0
+      check response["success"].getBool()
+      response["data"]
+
+    let current = getStats()
+    check current["userMessages"] == %1
+    check current["assistantMessages"] == %2
+    check current["toolCalls"] == %1
+    check current["toolResults"] == %1
+    check current["totalMessages"] == %4
+    check current["tokens"]["total"] == %25
+    let usage = current["contextUsage"]
+    check usage["tokens"].getInt() > 0
+    check usage["percent"].getFloat() == usage["tokens"].getInt().float * 100 / usage["contextWindow"].getInt().float
+
+    require sess.branchTo(compacted)
+    let afterCompaction = getStats()
+    check afterCompaction["totalMessages"] == %4
+    check afterCompaction["contextUsage"]["tokens"].kind == JNull
+    check afterCompaction["contextUsage"]["percent"].kind == JNull

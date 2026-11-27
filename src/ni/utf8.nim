@@ -1,5 +1,7 @@
 # UTF-8 byte boundaries for clipping text and validating provider payloads.
 
+import std/json
+
 const ContinuationBytes = {'\x80'..'\xBF'}
 
 proc utf8BoundaryBefore*(text: string, offset: int): int =
@@ -13,6 +15,20 @@ proc utf8BoundaryAfter*(text: string, offset: int): int =
   result = offset
   while result < text.len and text[result] in ContinuationBytes:
     inc result
+
+proc completeUtf8Prefix*(text: string): int =
+  ## Hold a possible incomplete trailing character until the next stream chunk.
+  if text.len == 0:
+    return 0
+  var start = text.high
+  while start > 0 and text.high - start < 3 and text[start] in ContinuationBytes:
+    dec start
+  let length = case text[start]
+    of '\xC2'..'\xDF': 2
+    of '\xE0'..'\xEF': 3
+    of '\xF0'..'\xF4': 4
+    else: 1
+  if text.len - start < length: start else: text.len
 
 proc replaceInvalidUtf8*(text: string): string =
   ## Replace malformed sequences with U+FFFD, preserving every valid UTF-8 byte.
@@ -46,3 +62,7 @@ proc replaceInvalidUtf8*(text: string): string =
   if copyFrom == 0:
     return text
   result.add(text[copyFrom ..< text.len])
+
+proc encodeJsonUtf8*(node: JsonNode): string =
+  ## Nim escapes JSON syntax but otherwise emits string bytes verbatim.
+  replaceInvalidUtf8($node)

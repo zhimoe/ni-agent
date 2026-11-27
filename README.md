@@ -30,10 +30,34 @@ Ni uses `~/.pi/agent` by default. Pass `--agent-dir` to use a separate configura
 - **Terminal interface.** Stream Markdown, tables, code, and diffs. Edit multiline input with UTF-8 and CJK support, prompt history, command completion, and `@file` completion. During a reply, `Enter` queues a steering message, and `Alt+Enter` (`Ctrl+Q` on Windows) queues a follow-up. Configure the follow-up shortcut with `app.message.followUp` in `~/.pi/agent/keybindings.json`. `Esc` interrupts a model reply and keeps the draft.
 - **Workspace tools.** Read, write, edit, run shell commands, search and list files, ask questions, and discover deferred tools. Fuzzy edits preserve the original BOM and line endings. Use `/copy` to copy a reply, code block, or diff.
 - **Configuration.** Reuse Pi settings, models, credentials, project trust, skills, and prompt templates. Ni supports stdio and Streamable HTTP MCP servers and manages them with `ni mcp list`, `add`, and `remove`.
+
+### Session recovery
+
+Ni 0.3.0 gives each saved session one writer at a time across Ni processes. If a session is already open for writing, close or switch away from it in the other process and retry. Use `--no-session --session <id-or-path>` to work from an in-memory copy. The operating system releases the writer lock when Ni exits, including after a forced stop.
+
+When a session contains malformed JSONL, Ni reports the file and the first affected line. It preserves the original bytes and starts the next entry on a new line, including when the last complete record has no final newline.
 - **Sessions.** Resume or fork Pi v3 JSONL sessions, navigate conversation branches, compact history, and export HTML, Markdown, or JSONL.
 - **Headless modes.** `--print` prints the final reply, `--mode json` streams JSONL events, and `--mode rpc` accepts JSONL commands on stdin. During model streaming, RPC clients can inspect state, steer, queue follow-ups, or abort. Other commands wait for the prompt to finish.
 
 RPC clients can use `get_entries` with an optional `since` entry ID to read session history in append order. `get_tree` returns nested branches and their labels. `get_fork_messages` lists the text prompts available for forking.
+
+Use `--session-id <id>` to continue an exact session ID in the current workspace or create it on first use. If older versions created multiple logs for one ID, Ni opens the most recently modified log. Use `--no-session --fork <id-or-path>` to continue from a saved branch in memory.
+
+JSON mode emits a Pi v3 session header before the first agent event. RPC `get_session_stats` includes session-wide user, assistant, tool call and tool result counts, plus an estimate for the active context.
+
+Print and JSON modes return `0` on completion, `1` on failure, `2` for truncated model output, `3` at the agent turn limit, and `130` on cancellation. JSONL and RPC `agent_end` events report the corresponding `stopReason` and `exitCode` for each run.
+
+### Tool permissions and process sandbox
+
+Use `--tools read,grep,find,ls` to limit which tools the model can execute or `--no-tools` to disable all model tools. `--sandbox read-only` prohibits project file edits and `--sandbox workspace-write` allows edits inside the workspace. Both modes constrain built-in file tools to the workspace and isolate Shell and stdio MCP processes. Sandboxed subprocesses can write to private scratch space, read system files subject to the platform policy, and cannot make IP connections through the host network. Configured HTTP MCP servers and model providers still connect through Ni.
+
+The process sandbox uses Seatbelt on macOS and bubblewrap on Linux. Requests for a restricted mode fail when its platform backend is unavailable. The default `off` mode uses the existing tool approval policy.
+
+### MCP authentication and management
+
+Use `ni mcp login <name>` for HTTP OAuth, `logout` to remove local OAuth credentials, and `reconnect` to test a fresh connection. `mcp enable` and `mcp disable` accept `--tool <name>` for individual tools. Inside the TUI use `/mcp login <name>`, `/mcp logout <name>` or `/mcp enable <name> [tool]` and `/mcp disable <name> [tool]`.
+
+OAuth discovery supports dynamic client registration and a preconfigured `oauth.clientId`. A registered client can specify `oauth.callbackPort` or a loopback `oauth.callbackUrl`, plus an optional `oauth.clientSecret` and `oauth.scope`. Use `--no-browser` to print the authorization URL. The browser must be able to reach Ni's loopback callback. Ni stores tokens under the agent directory in `mcp-credentials/`, keyed by server name and URL.
 
 ## Tests
 
@@ -43,4 +67,4 @@ nimble test
 
 The test task rebuilds Ni and runs unit and integration tests. The integration tests use local mock servers and require Python 3.
 
-See [Architecture](docs/architecture.md) for the runtime and module layout. Ni is distributed under the [MIT License](LICENSE).
+See [Architecture](docs/architecture.md) for the runtime and module layout, the [CLI agent comparison](docs/cli-agent-comparison.md) for the feature baseline, and [TODO](TODO.md) for the required follow-up work. Ni is distributed under the [MIT License](LICENSE).

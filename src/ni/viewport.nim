@@ -24,6 +24,7 @@ type
     tail*: seq[string]
     tailSeg*: int
     scrollUp*: int
+    visibleRows: int
 
 proc beginSegment*(t: Transcript, kind: SegmentKind, title = ""): int =
   ## Open a new logical message block; committed rows and the live tail attach to it.
@@ -85,21 +86,20 @@ proc segmentAt*(t: Transcript, idx: int): int =
   else:
     t.segments.high
 
-proc clampView(t: Transcript) =
-  t.scrollUp = clamp(t.scrollUp, 0, max(0, t.totalLines() - 1))
+proc maxScrollUp(t: Transcript): int =
+  max(0, t.totalLines() - max(1, t.visibleRows))
 
 proc scrollBy*(t: Transcript, delta: int) =
   ## Positive delta scrolls up into history; negative returns toward the live tail.
   if delta == 0:
     return
-  t.scrollUp += delta
-  t.clampView()
+  t.scrollUp = clamp(t.scrollUp + delta, 0, t.maxScrollUp())
 
 proc scrollToBottom*(t: Transcript) =
   t.scrollUp = 0
 
 proc scrollToTop*(t: Transcript) =
-  t.scrollUp = max(0, t.totalLines() - 1)
+  t.scrollUp = t.maxScrollUp()
 
 proc renderStickyHeader*(t: Transcript, segIdx, above, width: int): string =
   ## Render the pinned one-line header of the message that owns the topmost visible row.
@@ -110,7 +110,7 @@ proc renderStickyHeader*(t: Transcript, segIdx, above, width: int): string =
     of segThinking: styleDim("💭 thinking")
     of segTool: styleYellow("● tool")
     of segNotice: styleMagenta("• note")
-  let rightText = styleDim($above & " lines above · End ⇣")
+  let rightText = styleDim($above & " lines above" & (if t.atBottom(): "" else: " · End ⇣"))
   let prefix = styleDim("── ")
   let fixedW = visibleWidth(prefix) + visibleWidth(rightText) + 2
   var leftText = label
@@ -119,30 +119,33 @@ proc renderStickyHeader*(t: Transcript, segIdx, above, width: int): string =
   if title.len > 0 and titleAvail > 4:
     leftText.add(styleDim(" · " & truncateVisible(title, titleAvail)))
   let fill = max(1, width - fixedW - visibleWidth(leftText))
-  result = prefix & leftText & styleDim(" " & "─".repeat(fill) & " ") & rightText
+  let header = prefix & leftText & styleDim(" " & "─".repeat(fill) & " ") & rightText
+  fitScreenRow(header, width)
 
 proc renderHistory*(t: Transcript, width, rows: int): seq[string] =
-  ## Return exactly `rows` bottom-anchored transcript rows, pinning the active message header while scrolled.
+  ## Show up to one page of history while following the live tail or a scrolled position.
   result = newSeq[string](max(0, rows))
   if rows <= 0:
     return
+  t.visibleRows = rows
+  t.scrollUp = clamp(t.scrollUp, 0, t.maxScrollUp())
   let total = t.totalLines()
   if total == 0:
     return
   let inner = max(1, width)
-  var endIdx = clamp(total - t.scrollUp, 1, total)
+  let endIdx = total - t.scrollUp
   var startIdx = max(0, endIdx - rows)
   var headerRows = 0
-  if t.scrollUp > 0 and startIdx > 0 and t.segments.len > 0:
-    let seg = t.segmentAt(startIdx)
+  if startIdx > 0 and rows > 1:
+    let seg = t.segmentAt(startIdx + 1)
     if t.segStart[seg] < startIdx:
+      inc startIdx
       result[0] = t.renderStickyHeader(seg, startIdx, inner)
       headerRows = 1
-      startIdx = max(0, endIdx - (rows - headerRows))
   var row = headerRows
   var idx = startIdx
   while idx < endIdx and row < rows:
-    result[row] = truncateVisible(t.lineAt(idx), inner, ellipsis = "")
+    result[row] = fitScreenRow(t.lineAt(idx), inner)
     inc idx
     inc row
 
@@ -156,15 +159,39 @@ proc composeScreen*(t: Transcript, ed: InputEditor, status: EditorStatusInfo, co
   let historyRows = max(0, rows - dockLines.len)
   result = t.renderHistory(width, historyRows)
   for line in dockLines:
-    result.add(truncateVisible(line, width, ellipsis = ""))
+    result.add(fitScreenRow(line, width))
   if result.len > rows:
     result.setLen(rows)
   elif result.len < rows:
     result.add(newSeq[string](rows - result.len))
 
-proc paintDiff*(previous, frame: seq[string], fullRepaint = false): string =
-  ## Emit the minimal absolute-positioned repaint for the rows that actually changed.
+proc historyView*(t: Transcript): tuple[rows, endLine: int] =
+  (t.visibleRows, t.totalLines() - t.scrollUp)
+
+proc paintDiff*(previous, frame: seq[string], fullRepaint = false,
+                historyRows = 0, scrollRows = 0): string =
+  ## Repaint changed rows. For a matching history shift, let the terminal move
+  ## the existing body rows while keeping the header and dock in place.
   let full = fullRepaint or previous.len != frame.len
+  var scroll = false
+  if not full and historyRows in 3 .. frame.len and
+      scrollRows != 0 and abs(scrollRows) < historyRows - 2:
+    let first = max(1, 1 - scrollRows)
+    let past = min(historyRows, historyRows - scrollRows)
+    var reused = 0
+    for row in first ..< past:
+      if previous[row + scrollRows] != frame[row]:
+        reused = 0
+        break
+      if previous[row] != frame[row]:
+        inc reused
+    scroll = reused > abs(scrollRows)
+  if scroll:
+    result.add("\x1b[0m\x1b[2;" & $historyRows & "r\x1b[" & $abs(scrollRows) &
+      (if scrollRows > 0: "S" else: "T") & "\x1b[r")
   for i in 0 ..< frame.len:
-    if full or i >= previous.len or previous[i] != frame[i]:
+    let moves = scroll and i in 1 ..< historyRows
+    let oldRow = if moves: i + scrollRows else: i
+    let oldText = if full or (moves and oldRow notin 1 ..< historyRows): "" else: previous[oldRow]
+    if full or oldText != frame[i]:
       result.add("\x1b[" & $(i + 1) & ";1H" & frame[i] & "\x1b[K")

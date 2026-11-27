@@ -5,7 +5,7 @@ when defined(windows):
   import std/[monotimes, times, winlean]
 else:
   import std/[posix, termios]
-import ./types
+import ./[types, utf8]
 
 type
   KeyKind* = enum
@@ -151,15 +151,27 @@ proc terminalSize*(): tuple[cols: int, rows: int] =
       try: rows = parseInt(envRows) except ValueError: discard
   (clamp(cols, 20, 512), clamp(rows, 8, 256))
 
+const
+  BeginSyncSequence = "\x1b[?2026h"
+  EndSyncSequence = "\x1b[?2026l"
+
 proc beginSyncOutput*() =
   ## Enter DEC mode 2026 synchronized terminal output to prevent redraw flicker.
   if stdout.isatty():
-    stdout.write("\x1b[?2026h")
+    stdout.write(BeginSyncSequence)
 
 proc endSyncOutput*() =
   ## Exit DEC mode 2026 synchronized terminal output and flush stdout.
   if stdout.isatty():
-    stdout.write("\x1b[?2026l")
+    stdout.write(EndSyncSequence)
+  stdout.flushFile()
+
+proc writeSyncOutput*(output: string) =
+  ## Submit an already composed frame in one buffered write.
+  if stdout.isatty():
+    stdout.write(BeginSyncSequence & output & EndSyncSequence)
+  else:
+    stdout.write(output)
   stdout.flushFile()
 
 proc enableBracketedPaste*() =
@@ -257,7 +269,7 @@ proc runeDisplayWidth*(r: Rune): int =
   1
 
 proc skipAnsiSeq(s: string, start: int): int =
-  ## If s[start] starts an ANSI CSI/OSC escape sequence, return index past its end; otherwise return start.
+  ## Return the end of an ESC-prefixed control sequence.
   if start >= s.len or s[start] != '\x1b':
     return start
   if start + 1 >= s.len:
@@ -271,17 +283,20 @@ proc skipAnsiSeq(s: string, start: int): int =
       if c >= '@' and c <= '~':
         return i
     return s.len
-  elif nxt == ']':
+  elif nxt in {']', 'P', 'X', '^', '_'}:
     var i = start + 2
     while i < s.len:
-      if s[i] == '\x07':
+      if nxt == ']' and s[i] == '\x07':
         return i + 1
       if s[i] == '\x1b' and i + 1 < s.len and s[i + 1] == '\\':
         return i + 2
       inc i
     return s.len
   else:
-    return min(s.len, start + 2)
+    var i = start + 1
+    while i < s.len and s[i] in {' '..'/'}:
+      inc i
+    return i + (if i < s.len and s[i] in {'0'..'~'}: 1 else: 0)
 
 proc stripAnsi*(s: string): string =
   ## Strip all ANSI CSI/OSC escape sequences from s.
@@ -348,6 +363,57 @@ proc truncateVisible*(s: string, maxWidth: int, ellipsis = "…"): string =
   if ellW <= maxWidth:
     outBuf.add(ellipsis)
   outBuf
+
+proc hasTerminalControl(text: string): bool =
+  for r in text.runes:
+    if r.int < 32 or r.int in 0x7f .. 0x9f:
+      return true
+
+proc fitScreenRow*(line: string, width: int): string =
+  ## Convert content to one independently paintable row. Keep SGR and OSC 8
+  ## styles, but let the renderer own cursor movement and terminal modes.
+  let source = replaceInvalidUtf8(line)
+  var row = newStringOfCap(source.len)
+  var styled, linked = false
+  var i = 0
+  while i < source.len:
+    case source[i]
+    of '\x1b':
+      let endSeq = skipAnsiSeq(source, i)
+      let sequence = source[i ..< endSeq]
+      if sequence.len >= 3 and sequence.startsWith("\x1b[") and sequence.endsWith("m"):
+        let params = sequence[2 ..< sequence.high]
+        if params.allCharsInSet({'0'..'9', ';', ':'}):
+          row.add(sequence)
+          styled = params notin ["", "0"]
+      elif sequence.startsWith("\x1b]8;"):
+        let ending = if sequence.endsWith("\x07"): 1 elif sequence.endsWith("\x1b\\"): 2 else: 0
+        if ending > 0:
+          let payload = sequence[4 ..< sequence.len - ending]
+          let sep = payload.find(';')
+          if sep >= 0 and not payload.hasTerminalControl():
+            row.add(sequence)
+            linked = sep + 1 < payload.len
+      i = endSeq
+    of '\t':
+      row.add("  ")
+      inc i
+    of '\r', '\n':
+      row.add(' ')
+      inc i
+    else:
+      if source[i] in {'\x00'..'\x1f', '\x7f'}:
+        inc i
+      elif source[i] == '\xC2' and i + 1 < source.len and source[i + 1] in {'\x80'..'\x9f'}:
+        i += 2
+      else:
+        row.add(source[i])
+        inc i
+  if styled:
+    row.add("\x1b[0m")
+  if linked:
+    row.add("\x1b]8;;\x07")
+  truncateVisible(row, width, ellipsis = "")
 
 proc wrapAnsiText*(s: string, maxWidth: int, firstIndent = "", contIndent = ""): seq[string] =
   ## Word-wrap a single paragraph (preserving active ANSI SGR styles across wrapped lines and breaking cleanly on CJK).
@@ -513,11 +579,15 @@ proc decodeCsiSequence(paramsStr: string, finalCh: char): KeyEvent =
       return KeyEvent(kind: kkScrollDown)
     return KeyEvent(kind: kkDown)
   of 'M', 'm':
-    # SGR mouse tracking (`\x1b[<b;x;yM`): only wheel events scroll the transcript.
-    if paramsStr.len > 1 and paramsStr[0] == '<':
+    # SGR mouse reports encode Shift, Meta and Ctrl alongside the button code.
+    # Horizontal wheel reports (66/67) must leave the vertical viewport alone.
+    if finalCh == 'M' and paramsStr.len > 1 and paramsStr[0] == '<':
       let code = (try: parseInt(paramsStr[1 .. ^1].split(';')[0]) except ValueError: -1)
-      if finalCh == 'M' and code >= 0 and (code and 64) != 0:
-        return KeyEvent(kind: (if (code and 1) == 0: kkScrollUp else: kkScrollDown))
+      const MouseModifierBits = 4 or 8 or 16
+      case code and not MouseModifierBits
+      of 64: return KeyEvent(kind: kkScrollUp)
+      of 65: return KeyEvent(kind: kkScrollDown)
+      else: discard
     return KeyEvent(kind: kkMouseOther)
   of 'C':
     if paramsStr in ["1;3", "1;5", "3", "5"]:
@@ -837,6 +907,64 @@ proc clearRenderedLines*(lineCount: int) =
   stdout.flushFile()
 
 # Interactive `ask_question` & selector TUI widget
+
+proc selectSearchableOption*(title: string, options: openArray[QuestionOption]): int =
+  ## Return the selected original index, or -1 on cancellation.
+  if options.len == 0: return -1
+  var query = ""
+  var cursor = 0
+  var rendered = 0
+  while true:
+    let (cols, rows) = terminalSize()
+    let visible = max(1, (rows - 5) div 2)
+    let terms = strutils.splitWhitespace(query.toLower())
+    var matches: seq[int]
+    for index, option in options:
+      let searchable = (option.label & " " & option.description).toLower()
+      var matched = true
+      for term in terms:
+        if term notin searchable:
+          matched = false
+          break
+      if matched: matches.add(index)
+    cursor = clamp(cursor, 0, max(0, matches.high))
+    let first = clamp(cursor - visible + 1, 0, max(0, matches.len - visible))
+    var lines = @[styleBold(title), "  Filter: " & truncateVisible(query, max(1, cols - 12)),
+      styleDim("  ↑/↓ move · PgUp/PgDn page · Enter select · Esc cancel")]
+    if matches.len == 0: lines.add(styleDim("  No matching entries"))
+    for position in first ..< min(matches.len, first + visible):
+      let option = options[matches[position]]
+      let pointer = if position == cursor: styleCyan("❯ ") else: "  "
+      lines.add("  " & pointer & truncateVisible(option.label, max(1, cols - 5)))
+      if option.description.len > 0:
+        lines.add("      " & styleDim(truncateVisible(option.description, max(1, cols - 7))))
+    beginSyncOutput()
+    clearRenderedLines(rendered)
+    for line in lines: stdout.writeLine(line)
+    endSyncOutput()
+    rendered = lines.len
+    let key = readRawKey()
+    case key.kind
+    of kkUp: dec cursor
+    of kkDown: inc cursor
+    of kkHome: cursor = 0
+    of kkEnd: cursor = matches.high
+    of kkPageUp: cursor -= visible
+    of kkPageDown: cursor += visible
+    of kkChar, kkSpace:
+      query.add(key.text)
+      cursor = 0
+    of kkBackspace:
+      if query.len > 0: query.setLen(runeOffset(query, runeLen(query) - 1))
+      cursor = 0
+    of kkEnter, kkNewline:
+      if matches.len > 0:
+        clearRenderedLines(rendered)
+        return matches[cursor]
+    of kkEscape, kkCtrlC, kkCtrlD, kkEof:
+      clearRenderedLines(rendered)
+      return -1
+    else: discard
 
 proc promptQuestionWidget*(item: AskQuestionItem): AskQuestionAnswer =
   ## Render an interactive single/multi-select question menu with arrow keys, numbers, checkboxes, and custom 'Other' input.

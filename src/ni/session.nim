@@ -1,11 +1,21 @@
 # Pi v3 compatible JSONL tree session manager (persistence, branching, resume, fork, and compaction).
 
-import std/[algorithm, json, options, os, random, strutils, tables, times]
+import std/[algorithm, json, monotimes, options, os, random, strutils, tables, tempfiles, times]
+when defined(windows):
+  import std/winlean
+else:
+  from std/posix import EINTR, EAGAIN, EWOULDBLOCK
 import ./[types, config, utf8]
 
 const SessionFormatVersion* = 3
 
 type
+  SessionLock = object
+    when defined(windows):
+      handle: Handle
+    else:
+      file: File
+
   SessionEntryKind* = enum
     sekMessage = "message"
     sekModelChange = "model_change"
@@ -57,6 +67,68 @@ type
     indexById*: Table[string, int]
     leafId*: string
     totalUsage*: Usage
+    diagnostics*: seq[string]
+    writer: SessionLock
+    needsLineBreak: bool
+    closed: bool
+
+proc `=destroy`(lock: SessionLock) =
+  when defined(windows):
+    if lock.handle != 0:
+      discard closeHandle(lock.handle)
+  else:
+    if not lock.file.isNil:
+      lock.file.close()
+
+proc `=copy`(dest: var SessionLock, source: SessionLock) {.error.}
+
+when not defined(windows):
+  proc sessionFlock(fd, operation: cint): cint {.importc: "flock", header: "<sys/file.h>".}
+
+proc lockFile(path, busyMessage: string, waitMs = 0): SessionLock =
+  # Keep the sidecar so waiters always contend on the same file. The OS
+  # releases the lock even if the writer is killed.
+  createDir(parentDir(path))
+  when not defined(windows):
+    result.file = open(path, fmAppend)
+  let deadline = getMonoTime() + initDuration(milliseconds = waitMs)
+  while true:
+    when defined(windows):
+      let handle = createFileW(newWideCString(path), GENERIC_WRITE, 0, nil,
+                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+      if handle != INVALID_HANDLE_VALUE:
+        result.handle = handle
+        return
+      let error = osLastError()
+      const SharingViolation = 32
+      if error.int32 != SharingViolation:
+        raiseOSError(error, path)
+    else:
+      const ExclusiveNonBlocking = 2 or 4
+      if sessionFlock(cint(result.file.getOsFileHandle()), ExclusiveNonBlocking) == 0:
+        return
+      let error = osLastError()
+      if error.int32 == EINTR:
+        continue
+      if error.int32 notin [EAGAIN, EWOULDBLOCK]:
+        raiseOSError(error, path)
+    if getMonoTime() >= deadline:
+      raise newException(IOError, busyMessage)
+    sleep(20)
+
+proc acquireWriter(sm: SessionManager) =
+  if sm.closed:
+    raise newException(IOError, "Session is closed: " & sm.filePath)
+  when defined(windows):
+    if sm.writer.handle != 0: return
+  else:
+    if not sm.writer.file.isNil: return
+  sm.writer = lockFile(sm.filePath & ".lock", "Session is already open for writing: " & sm.filePath)
+
+proc close*(sm: SessionManager) =
+  if not sm.isNil:
+    reset(sm.writer)
+    sm.closed = true
 
 var rngInitialized = false
 
@@ -190,11 +262,8 @@ proc parseEntryJson(node: JsonNode): Option[SessionEntry] =
   else:
     none(SessionEntry)
 
-proc writeHeaderIfNeeded(sm: SessionManager) =
-  if not sm.persist or sm.filePath.len == 0 or fileExists(sm.filePath):
-    return
-  createDir(parentDir(sm.filePath))
-  var hdr = %*{
+proc sessionHeaderToJson*(sm: SessionManager): JsonNode =
+  result = %*{
     "type": "session",
     "version": SessionFormatVersion,
     "id": sm.id,
@@ -202,13 +271,42 @@ proc writeHeaderIfNeeded(sm: SessionManager) =
     "cwd": sm.cwd
   }
   if sm.parentSessionPath.len > 0:
-    hdr["parentSession"] = %sm.parentSessionPath
-  writeFile(sm.filePath, replaceInvalidUtf8($hdr) & "\n")
+    result["parentSession"] = %sm.parentSessionPath
+
+proc flushSessionFile(file: File, path: string) =
+  proc fflush(stream: File): cint {.importc, header: "<stdio.h>".}
+  if fflush(file) != 0:
+    raise newException(IOError, "Could not flush session data: " & path)
+
+proc writeHeaderIfNeeded(sm: SessionManager) =
+  if not sm.persist or sm.filePath.len == 0 or fileExists(sm.filePath):
+    return
+  let (f, temporary) = createTempFile(".ni-session-", "", parentDir(sm.filePath))
+  try:
+    try:
+      f.writeLine(encodeJsonUtf8(sm.sessionHeaderToJson()))
+      flushSessionFile(f, sm.filePath)
+    finally:
+      f.close()
+    moveFile(temporary, sm.filePath)
+  finally:
+    if fileExists(temporary): removeFile(temporary)
 
 proc appendRawEntry(sm: SessionManager, entry: SessionEntry) =
   var e = entry
   while sm.indexById.hasKey(e.id):
     e.id = genShortId()
+  if sm.persist:
+    sm.acquireWriter()
+    sm.writeHeaderIfNeeded()
+    let f = open(sm.filePath, fmAppend)
+    defer: f.close()
+    let separator = if sm.needsLineBreak: "\n" else: ""
+    # If this write fails partway, the next append still starts on a fresh line.
+    sm.needsLineBreak = true
+    f.write(separator & encodeJsonUtf8(entryToJson(e)) & "\n")
+    flushSessionFile(f, sm.filePath)
+    sm.needsLineBreak = false
   sm.indexById[e.id] = sm.entries.len
   sm.entries.add(e)
   sm.leafId = e.id
@@ -223,13 +321,13 @@ proc appendRawEntry(sm: SessionManager, entry: SessionEntry) =
   elif e.kind == sekSessionInfo and e.name.len > 0:
     sm.displayName = e.name
 
-  if sm.persist and sm.filePath.len > 0:
-    sm.writeHeaderIfNeeded()
-    let f = open(sm.filePath, fmAppend)
-    defer: f.close()
-    f.writeLine(replaceInvalidUtf8($entryToJson(e)))
+proc findSessionByExactId*(sessionsRoot, cwd, id: string): Option[string]
 
-proc newSessionManager*(
+proc lockSessionCatalog(sessionsRoot, cwd: string): SessionLock =
+  let path = sessionsRoot / sanitizeCwdBucket(cwd) / ".ni-session-catalog.lock"
+  lockFile(path, "Session directory is busy: " & parentDir(path), waitMs = 5000)
+
+proc createSessionManager(
   cwd: string,
   sessionsRoot: string,
   persist = true,
@@ -237,12 +335,15 @@ proc newSessionManager*(
   sessionName = "",
   parentSessionPath = ""
 ): SessionManager =
-  ## Create a new empty SessionManager (persisted lazily on first entry, matching Pi).
   let sid = if customSessionId.strip().len > 0: customSessionId.strip() else: genSessionUuid()
   let tsIso = nowIsoUtc()
   let fileStamp = now().utc.format("yyyyMMdd'T'HHmmss")
   let bucketDir = sessionsRoot / sanitizeCwdBucket(cwd)
-  let fpath = if persist: bucketDir / (fileStamp & "_" & sid & ".jsonl") else: ""
+  var fpath = ""
+  if persist:
+    fpath = bucketDir / (fileStamp & "_" & sid & ".jsonl")
+    while fileExists(fpath):
+      fpath = bucketDir / (fileStamp & "-" & genShortId() & "_" & sid & ".jsonl")
 
   result = SessionManager(
     id: sid,
@@ -257,6 +358,9 @@ proc newSessionManager*(
     leafId: "",
     totalUsage: Usage()
   )
+  if persist and customSessionId.strip().len > 0:
+    result.acquireWriter()
+    result.writeHeaderIfNeeded()
   if sessionName.strip().len > 0:
     result.appendRawEntry(SessionEntry(
       id: genShortId(),
@@ -266,29 +370,52 @@ proc newSessionManager*(
       name: sessionName.strip()
     ))
 
+proc newSessionManager*(cwd, sessionsRoot: string, persist = true, customSessionId = "",
+                        sessionName = "", parentSessionPath = ""): SessionManager =
+  ## Automatically named sessions only write a log when they receive an entry.
+  let id = customSessionId.strip()
+  if persist and id.len > 0:
+    let catalog {.used.} = lockSessionCatalog(sessionsRoot, cwd)
+    if findSessionByExactId(sessionsRoot, cwd, id).isSome:
+      raise newException(IOError, "Session already exists with ID: " & id)
+    return createSessionManager(cwd, sessionsRoot, persist, id, sessionName, parentSessionPath)
+  createSessionManager(cwd, sessionsRoot, persist, id, sessionName, parentSessionPath)
+
 proc loadSessionFile*(path: string, persist = true): SessionManager =
   ## Load an existing Pi v3 JSONL session file and reconstruct its tree and leaf state.
+  let expanded = expandFilename(path)
+  var writer: SessionLock
+  if persist:
+    writer = lockFile(expanded & ".lock", "Session is already open for writing: " & expanded)
   # Older versions could write raw bytes from files or command output into JSONL.
-  let raw = replaceInvalidUtf8(stripUtf8Bom(readFile(path)))
+  let bytes = readFile(expanded)
+  let raw = replaceInvalidUtf8(stripUtf8Bom(bytes))
   let lines = raw.replace("\r\n", "\n").split('\n')
 
   result = SessionManager(
     id: genSessionUuid(),
     cwd: getCurrentDir(),
-    filePath: normalizedPath(absolutePath(path)),
+    filePath: expanded,
     persist: persist,
     createdAtIso: nowIsoUtc(),
     entries: @[],
     indexById: initTable[string, int](),
     leafId: "",
-    totalUsage: Usage()
+    totalUsage: Usage(),
+    writer: move(writer),
+    needsLineBreak: bytes.len > 0 and bytes[^1] != '\n'
   )
 
-  for line in lines:
+  var firstMalformed = 0
+  var malformed = 0
+  for index, line in lines.pairs:
     let trimmed = line.strip()
     if trimmed.len == 0:
       continue
-    let node = try: parseJson(trimmed) except CatchableError: continue
+    let node = try: parseJson(trimmed) except JsonParsingError:
+      if firstMalformed == 0: firstMalformed = index + 1
+      inc malformed
+      continue
     if node.kind != JObject:
       continue
     if node{"type"}.getStr("") == "session":
@@ -313,6 +440,26 @@ proc loadSessionFile*(path: string, persist = true): SessionManager =
         result.totalUsage.cacheWriteTokens += e.message.usage.cacheWriteTokens
         result.totalUsage.totalTokens += e.message.usage.totalTokens
         result.totalUsage.costTotal += e.message.usage.costTotal
+
+  # Keep Ni's branch cursor outside Pi's append-only JSONL. Ignore stale cursors
+  # when a different process has appended to the file.
+  if malformed > 0:
+    result.diagnostics.add("Skipped " & $malformed & " malformed session record(s) in " & expanded &
+      " (first at line " & $firstMalformed & ")")
+  if result.entries.len > 0 and fileExists(expanded & ".leaf"):
+    try:
+      let cursor = parseFile(expanded & ".leaf")
+      let selected = cursor{"leafId"}.getStr("")
+      if cursor{"lastEntryId"}.getStr("") == result.leafId and cursor{"size"}.getBiggestInt(-1) == bytes.len and
+          (selected.len == 0 or result.indexById.hasKey(selected)):
+        result.leafId = selected
+    except CatchableError:
+      discard
+
+proc reopenSession*(sm: SessionManager, path: string): SessionManager =
+  if cmpPaths(sm.filePath, expandFilename(path)) == 0:
+    return sm
+  loadSessionFile(path, persist = sm.persist)
 
 proc appendMessage*(sm: SessionManager, msg: AgentMessage): string =
   ## Append a message node as a child of the current leaf and return its entry ID.
@@ -354,6 +501,20 @@ proc appendSessionName*(sm: SessionManager, name: string) =
     name: name
   ))
 
+proc openNamedSession*(cwd, sessionsRoot, id: string, name = ""): SessionManager =
+  ## Hold the workspace catalog lock through lookup and reservation of a new ID.
+  var existingPath: string
+  block:
+    let catalog {.used.} = lockSessionCatalog(sessionsRoot, cwd)
+    let found = findSessionByExactId(sessionsRoot, cwd, id)
+    if found.isNone:
+      return createSessionManager(cwd, sessionsRoot, customSessionId = id, sessionName = name)
+    existingPath = found.get
+  result = loadSessionFile(existingPath)
+  let title = name.strip()
+  if title.len > 0 and title != result.displayName:
+    result.appendSessionName(title)
+
 proc appendCompaction*(sm: SessionManager, summary, firstKeptEntryId: string, tokensBefore: int): string =
   ## Append a context compaction summary entry on the active branch.
   let id = genShortId()
@@ -371,13 +532,23 @@ proc appendCompaction*(sm: SessionManager, summary, firstKeptEntryId: string, to
 
 proc branchTo*(sm: SessionManager, targetEntryId: string): bool =
   ## Move the active leaf pointer to an earlier entry (or "" for a fresh root branch).
-  if targetEntryId.len == 0:
-    sm.leafId = ""
-    return true
-  if sm.indexById.hasKey(targetEntryId):
-    sm.leafId = targetEntryId
-    return true
-  false
+  if targetEntryId.len > 0 and not sm.indexById.hasKey(targetEntryId):
+    return false
+  if sm.persist and sm.entries.len > 0 and fileExists(sm.filePath):
+    sm.acquireWriter()
+    let (f, temporary) = createTempFile(".ni-leaf-", "", parentDir(sm.filePath))
+    try:
+      try:
+        f.writeLine(encodeJsonUtf8(%*{"leafId": targetEntryId, "lastEntryId": sm.entries[^1].id,
+          "size": getFileSize(sm.filePath)}))
+        flushSessionFile(f, sm.filePath & ".leaf")
+      finally:
+        f.close()
+      moveFile(temporary, sm.filePath & ".leaf")
+    finally:
+      if fileExists(temporary): removeFile(temporary)
+  sm.leafId = targetEntryId
+  true
 
 proc activeBranchEntries*(sm: SessionManager): seq[SessionEntry] =
   ## Walk parentId links from leafId back to the root and return entries in chronological order.
@@ -521,6 +692,35 @@ proc listSessions*(sessionsRoot: string, cwdFilter = ""): seq[SessionSummaryInfo
 
   result.sort(proc(a, b: SessionSummaryInfo): int = cmp(b.modifiedTime, a.modifiedTime))
 
+proc findSessionByExactId*(sessionsRoot, cwd, id: string): Option[string] =
+  ## Read session headers in the current workspace. Prefer the newest log if an
+  ## older version created multiple files with the same ID.
+  let bucket = sessionsRoot / sanitizeCwdBucket(cwd)
+  if id.len == 0 or not dirExists(bucket):
+    return none(string)
+  var latest: Time
+  for kind, path in walkDir(bucket):
+    if kind notin {pcFile, pcLinkToFile} or not path.endsWith(".jsonl"):
+      continue
+    try:
+      let f = open(path)
+      defer: f.close()
+      var line: string
+      if not f.readLine(line):
+        continue
+      let header = parseJson(replaceInvalidUtf8(stripUtf8Bom(line)))
+      if header{"type"}.getStr("") != "session" or header{"id"}.getStr("") != id:
+        continue
+      let savedCwd = header{"cwd"}.getStr("")
+      if savedCwd.len > 0 and cmpPaths(normalizedPath(savedCwd), normalizedPath(cwd)) != 0:
+        continue
+      let modified = getLastModificationTime(path)
+      if result.isNone or modified > latest or (modified == latest and path > result.get):
+        latest = modified
+        result = some(path)
+    except CatchableError:
+      continue
+
 proc findSessionByIdOrPath*(sessionsRoot, cwd, spec: string): Option[string] =
   ## Locate a session file by direct file path or full/prefix session ID.
   let resolved = resolvePathFrom(spec, cwd)
@@ -533,17 +733,19 @@ proc findSessionByIdOrPath*(sessionsRoot, cwd, spec: string): Option[string] =
         return some(info.filePath)
   none(string)
 
-proc forkSession*(sourcePath, targetCwd, sessionsRoot: string, customSessionId = ""): SessionManager =
-  ## Copy active branch entries of sourcePath into a brand-new session file in targetCwd.
+proc forkSession*(sourcePath, targetCwd, sessionsRoot: string, customSessionId = "",
+                  persist = true): SessionManager =
+  ## Copy the active branch into a new session in targetCwd.
   let src = loadSessionFile(sourcePath, persist = false)
   result = newSessionManager(
     cwd = targetCwd,
     sessionsRoot = sessionsRoot,
-    persist = true,
+    persist = persist,
     customSessionId = customSessionId,
     sessionName = (if src.displayName.len > 0: src.displayName & " (fork)" else: ""),
     parentSessionPath = src.filePath
   )
+  result.diagnostics = src.diagnostics
   for e in src.activeBranchEntries():
     if e.kind == sekSessionInfo:
       continue
@@ -676,11 +878,12 @@ proc sessionTreeToJson*(sm: SessionManager): JsonNode =
       cmp(a["entry"]["timestamp"].getStr(), b["entry"]["timestamp"].getStr())
     )
 
-proc forkSessionAtEntry*(sm: SessionManager, targetEntryId: string, sessionsRoot: string): SessionManager =
+proc forkSessionAtEntry*(sm: SessionManager, targetEntryId: string, sessionsRoot: string,
+                         before = false): SessionManager =
   ## Fork an open SessionManager from targetEntryId (or current leaf when empty) into a new session file.
   let savedLeaf = sm.leafId
   if targetEntryId.len > 0 and sm.indexById.hasKey(targetEntryId):
-    sm.leafId = targetEntryId
+    sm.leafId = if before: sm.entries[sm.indexById[targetEntryId]].parentId else: targetEntryId
   let branch = sm.activeBranchEntries()
   sm.leafId = savedLeaf
 

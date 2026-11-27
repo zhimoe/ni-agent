@@ -1,6 +1,7 @@
 import std/os
+from ./src/ni/release_info import NiVersion
 
-version       = "0.2.0"
+version       = NiVersion
 author        = "ni contributors"
 description   = "Minimal, extensible coding agent in Nim compatible with Pi configurations"
 license       = "MIT"

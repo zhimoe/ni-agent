@@ -1,6 +1,6 @@
 # Project trust store (~/.pi/agent/trust.json) and core runtime security policies.
 
-import std/[json, options, os, strutils, tables, algorithm]
+import std/[json, options, os, strutils, strtabs, tables, algorithm]
 import ./[types, config]
 
 const ProtectedProjectEntries = [
@@ -21,6 +21,11 @@ type
     sbBubblewrap = "bubblewrap"   # Reserved: Linux bwrap namespace isolation
     sbWindowsJob = "windows_job"  # Reserved: Windows Job Object / restricted token
 
+  SandboxMode* = enum
+    sandboxOff = "off"
+    sandboxReadOnly = "read-only"
+    sandboxWorkspaceWrite = "workspace-write"
+
   CommandSandboxProc* = proc(exe: string, args: seq[string], cwd: string): tuple[exe: string, args: seq[string]] {.closure.}
 
   SecurityPolicy* = ref object
@@ -29,6 +34,8 @@ type
     mode*: SecurityMode
     prompt*: PermissionPromptCallback
     sandboxKind*: SandboxKind
+    sandboxMode*: SandboxMode
+    sandboxTempDir*: string
     sandboxWrap*: CommandSandboxProc
 
 proc canonicalKey*(p: string): string =
@@ -40,11 +47,18 @@ proc canonicalKey*(p: string): string =
     norm = norm.replace('/', '\\').toLowerAscii()
   norm
 
-proc safeCanonicalPath(p: string): string =
+proc safeCanonicalPath(p: string, linkDepth = 0): string =
   let absP = if p.isAbsolute: normalizedPath(p) else: normalizedPath(getCurrentDir() / p)
   var cur = absP
   var tailParts: seq[string] = @[]
   while cur.len > 0 and not dirExists(cur) and not fileExists(cur):
+    if symlinkExists(cur):
+      if linkDepth >= 40:
+        raise newException(IOError, "Too many symlinks while resolving " & p)
+      var target = resolvePathFrom(expandSymlink(cur), parentDir(cur))
+      for i in countdown(tailParts.high, 0):
+        target = target / tailParts[i]
+      return safeCanonicalPath(target, linkDepth + 1)
     let name = extractFilename(cur)
     let parent = parentDir(cur)
     if parent == cur or name.len == 0:
@@ -78,6 +92,31 @@ proc isPathWithinDir*(baseDir, candidatePath: string): bool =
   let sep = when defined(windows): '\\' else: '/'
   let prefix = if baseNorm.endsWith($sep): baseNorm else: baseNorm & $sep
   candNorm.startsWith(prefix)
+
+proc checkFileRead*(policy: SecurityPolicy, path: string): string =
+  if not policy.isNil and policy.sandboxMode != sandboxOff:
+    if not isPathWithinDir(policy.cwd, path) or isPathWithinDir(policy.agentDir, path):
+      return "Sandbox only allows file tools to access the workspace: " & path
+  ""
+
+proc processEnvironment*(policy: SecurityPolicy): StringTableRef =
+  result = newStringTable(modeCaseSensitive)
+  for key, value in envPairs():
+    if policy.isNil or policy.sandboxMode == sandboxOff or
+        key in ["PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "TZ"] or key.startsWith("LC_"):
+      result[key] = value
+  if not policy.isNil and policy.sandboxTempDir.len > 0:
+    for key in ["TMPDIR", "TMP", "TEMP"]:
+      result[key] = policy.sandboxTempDir
+
+proc wrapProcess*(policy: SecurityPolicy, exe: string, args: seq[string], cwd: string):
+    tuple[exe: string, args: seq[string]] =
+  if not policy.isNil and not policy.sandboxWrap.isNil:
+    let resolved = if exe.isAbsolute: exe elif DirSep in exe: cwd / exe else: findExe(exe)
+    if resolved.len == 0:
+      raise newException(IOError, "Executable not found: " & exe)
+    return policy.sandboxWrap(resolved, args, cwd)
+  (exe, args)
 
 # Project trust (~/.pi/agent/trust.json)
 
@@ -249,6 +288,11 @@ proc checkFileMutation*(policy: SecurityPolicy, targetPath: string, isEdit: bool
   ## Return "" when writing/editing targetPath is allowed, or an error description when denied.
   if policy.isNil:
     return ""
+  if policy.sandboxMode == sandboxReadOnly:
+    return "Read-only sandbox prohibits editing workspace files"
+  let sandboxDenial = policy.checkFileRead(targetPath)
+  if sandboxDenial.len > 0:
+    return sandboxDenial
   let (sens, sensReason) = policy.isSensitivePath(targetPath)
   if sens:
     return policy.askOrDeny(paSensitiveFile, targetPath, sensReason)

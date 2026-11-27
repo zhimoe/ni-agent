@@ -6,7 +6,7 @@ The CLI loads user settings, resolves project trust, and loads the permitted wor
 
 The agent expands file references, skills, and prompt templates. It combines the active session branch with instructions and tool schemas, then sends the request to the selected provider. Provider adapters translate requests and responses into shared message and stream event types. The agent executes tool calls, records their results, and sends the updated context on the next turn.
 
-The terminal interface renders stream events above the editor. Completed Markdown blocks are written to scrollback. The current draft and the unfinished response are redrawn as they change. On resize, the terminal history is rebuilt from the current Ni transcript.
+The terminal interface renders stream events above the editor. Fullscreen mode keeps a transcript above a fixed input dock. Resuming a session or selecting a branch rebuilds the transcript from the active entries. Ni records the branch cursor beside the Pi-compatible JSONL and ignores it once that log changes.
 
 RPC reads stdin on a dedicated thread. The agent thread processes prompt controls while waiting for provider data or a dialog response. Commands that change the session run after the active prompt settles.
 
@@ -31,7 +31,8 @@ RPC reads stdin on a dedicated thread. The agent thread processes prompt control
 | `src/ni/markdown.nim` | Render Markdown, tables, syntax-highlighted code, and streamed response blocks. |
 | `src/ni/tui.nim` | Render the transcript and editor, dispatch slash commands, and handle interactive input during replies. |
 | `src/ni/rpc.nim` | Receive JSONL commands and send responses, agent events, and dialog requests. |
-| `src/ni/sandbox.nim` | Define the reserved CodeMode engine interface. |
+| `src/ni/sandbox.nim` | Configure restricted process execution and define the reserved CodeMode engine interface. |
+| `src/ni/mcp_oauth.nim` | Discover HTTP authorization servers, run PKCE login, and manage OAuth credentials. |
 
 ## Integration points
 

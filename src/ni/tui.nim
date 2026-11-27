@@ -1,7 +1,7 @@
 # Interactive Docked TUI (persistent bottom input bar, live status border, searchable /model selector, streaming Markdown), print & JSONL modes.
 
-import std/[algorithm, json, options, os, sets, strutils, tables]
-import ./[types, config, trust, provider, tools, skills, mcp, session, prompt, agent, brand, terminal_io, keybindings, editor, markdown, viewport]
+import std/[algorithm, json, monotimes, options, os, sets, strutils, tables, times]
+import ./[types, config, trust, provider, tools, skills, mcp, session, agent, brand, terminal_io, keybindings, editor, markdown, viewport, utf8, release_info]
 
 type
   DockViewport* = ref object
@@ -12,12 +12,19 @@ type
     gitBranch*: string
     workingPhase: string
     workingDetail: string
+    workingStarted: MonoTime
+    drawnWorkingSecond: int64
+    contextRevision: tuple[session: SessionManager, leafId: string, config: ConfigBundle, window: int]
+    contextPct: int
     activeTailLines*: seq[string]
     drawnFrame: seq[string]
     drawnSize: tuple[cols: int, rows: int]
+    drawnHistory: tuple[rows, endLine: int]
+    paintPending: bool
+    nextPaint: MonoTime
+    pendingKey: Option[KeyEvent]
     suspended*: bool
     fullScreen*: bool
-    turnStartMs: int64
 
   ModelPickResult = object
     cancelled: bool
@@ -94,7 +101,7 @@ proc buildSlashCommandDefs*(rt: AgentRuntime): seq[SlashCommandDef] =
     SlashCommandDef(name: "name", argumentHint: "<title>", description: "Set display title for the current session", source: "builtin"),
     SlashCommandDef(name: "skills", description: "List discovered Agent Skills", source: "builtin"),
     SlashCommandDef(name: "prompts", description: "List discovered Markdown prompt templates", source: "builtin"),
-    SlashCommandDef(name: "mcp", argumentHint: "[list|reconnect]", description: "Show MCP server states/tools or reconnect", source: "builtin"),
+    SlashCommandDef(name: "mcp", argumentHint: "[list|reconnect|login|logout|enable|disable]", description: "Inspect and manage MCP servers", source: "builtin"),
     SlashCommandDef(name: "tools", argumentHint: "[+name|-name]", description: "List active tools or enable/disable tools", source: "builtin"),
     SlashCommandDef(name: "trust", argumentHint: "[allow|deny|status]", description: "Inspect or update project trust", source: "builtin"),
     SlashCommandDef(name: "login", argumentHint: "[provider]", description: "Save API key into ~/.pi/agent/auth.json", source: "builtin"),
@@ -134,23 +141,15 @@ proc buildModelAutocompleteItems*(rt: AgentRuntime): seq[AutocompleteItem] =
       score: (if isCfg: 100 else: 10)
     ))
 
-proc buildEditorStatus*(rt: AgentRuntime, gitBranch: string, workingStatus = ""): EditorStatusInfo =
+proc estimateEditorContextPct(rt: AgentRuntime): int =
   let (msgs, _, _) = rt.session.buildActiveContext()
-  let sysPrompt = buildSystemPrompt(PromptBuildInput(
-    cwd: rt.cfg.cwd,
-    customSystemPrompt: rt.cfg.customSystemPrompt,
-    appendSystemPrompt: rt.cfg.appendSystemPrompt,
-    cliAppendPrompts: rt.cliAppendPrompts,
-    contextFiles: rt.cfg.contextFiles,
-    toolRegistry: rt.toolRegistry,
-    skills: rt.skills,
-    mcpManager: rt.mcpManager
-  ))
-  let estTok = estimateContextTokens(sysPrompt, msgs)
-  let pct = if rt.currentModel.contextWindow > 0 and msgs.len > 0:
+  if rt.currentModel.contextWindow > 0 and msgs.len > 0:
+    let estTok = estimateContextTokens(rt.runtimeSystemPrompt(), msgs)
     clamp((estTok * 100) div rt.currentModel.contextWindow, 1, 100)
   else:
     0
+
+proc buildEditorStatus*(rt: AgentRuntime, gitBranch: string, workingStatus = "", contextPct = -1): EditorStatusInfo =
   let u = rt.session.totalUsage
   let isSub = rt.currentModel.provider == "kimi-coding" or
               (rt.cfg.auth.hasKey(rt.currentModel.provider) and rt.cfg.auth[rt.currentModel.provider].kind == ckOAuth)
@@ -165,7 +164,7 @@ proc buildEditorStatus*(rt: AgentRuntime, gitBranch: string, workingStatus = "")
     sessionName: rt.session.displayName,
     modelLabel: rt.currentModel.id,
     thinkingLabel: (if rt.currentModel.reasoning: $rt.thinkingLevel else: "off"),
-    contextPct: pct,
+    contextPct: (if contextPct >= 0: contextPct else: rt.estimateEditorContextPct()),
     contextWindow: rt.currentModel.contextWindow,
     inputTokens: u.inputTokens,
     outputTokens: u.outputTokens,
@@ -196,53 +195,60 @@ proc setWorkingStatus(vp: DockViewport, phase = "", detail = "") =
   vp.workingPhase = phase
   vp.workingDetail = detail
 
-proc setThinkingStatus(vp: DockViewport, chars: int) =
-  vp.setWorkingStatus("Thinking", align(formatCompactCount(chars), 6) & " chars")
+const FrameIntervalMs = 17
 
-const
-  SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-  SpinnerIntervalMs = 100
+proc elapsedWorkingSeconds(vp: DockViewport): int64 =
+  (getMonoTime() - vp.workingStarted).inSeconds
 
-proc elapsedMilliseconds(vp: DockViewport): int64 =
-  max(0'i64, nowUnixMs() - vp.turnStartMs)
-
-proc formatWorkingStatus(vp: DockViewport): string =
+proc formatWorkingStatus(vp: DockViewport, elapsedSeconds: int64): string =
   if vp.workingPhase.len == 0:
     return ""
   if vp.workingPhase == "Interrupting":
     return styleYellow("Interrupting…")
-  let elapsedMs = vp.elapsedMilliseconds()
-  let spinner = SpinnerFrames[(elapsedMs div SpinnerIntervalMs) mod SpinnerFrames.len]
-  let elapsed = elapsedMs div 1000
-  let minutes = align($(elapsed div 60), 2, '0')
-  let seconds = align($(elapsed mod 60), 2, '0')
-  styleCyan(spinner & " " & vp.workingPhase) & styleDim(" " & minutes & ":" & seconds & "s" &
+  let interruptHint = if activeRunAbort.isNil: "" else: " · Esc to interrupt"
+  styleCyan("• " & vp.workingPhase) & styleDim(" (" & $elapsedSeconds & "s" & interruptHint & ")" &
     (if vp.workingDetail.len > 0: " · " & vp.workingDetail else: ""))
 
-proc paintScreen(vp: DockViewport, forceRepaint = false) =
+proc paintScreen(vp: DockViewport) =
   ## Compose and paint one full frame: scrollable transcript above, input box + status line pinned to the bottom.
   if vp.isNil or not vp.isDockedActive():
     return
   let (cols, rows) = terminalSize()
-  var full = forceRepaint or cols != vp.drawnSize.cols or rows != vp.drawnSize.rows
+  let full = cols != vp.drawnSize.cols or rows != vp.drawnSize.rows
   if full:
     vp.drawnFrame.setLen(0)
-  vp.transcript.setTail(vp.activeTailLines)
-  let status = buildEditorStatus(vp.rt, vp.gitBranch, vp.formatWorkingStatus())
+  let rt = vp.rt
+  let revision = (rt.session, rt.session.leafId, rt.cfg, rt.currentModel.contextWindow)
+  if revision != vp.contextRevision:
+    vp.contextPct = rt.estimateEditorContextPct()
+    vp.contextRevision = revision
+  let second = if vp.workingPhase.len > 0: vp.elapsedWorkingSeconds() else: 0'i64
+  let status = buildEditorStatus(rt, vp.gitBranch, vp.formatWorkingStatus(second), vp.contextPct)
   let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows)
+  let history = vp.transcript.historyView()
+  let scrollRows = if history.rows == vp.drawnHistory.rows:
+    history.endLine - vp.drawnHistory.endLine else: 0
   var output = ""
   if full and vp.drawnSize.cols > 0:
     output.add("\x1b[2J")
-  output.add(paintDiff(vp.drawnFrame, frame, fullRepaint = full))
+  output.add(paintDiff(vp.drawnFrame, frame, fullRepaint = full,
+    historyRows = history.rows, scrollRows = scrollRows))
   if output.len > 0:
-    beginSyncOutput()
-    stdout.write(output)
-    endSyncOutput()
+    # Keep wide glyphs from wrapping into adjacent rows during a diff repaint.
+    writeSyncOutput("\x1b[?7l" & output & "\x1b[?7h")
   vp.drawnFrame = frame
   vp.drawnSize = (cols, rows)
+  vp.drawnHistory = history
+  vp.drawnWorkingSecond = second
+
+proc flushPaint(vp: DockViewport, immediate = false) =
+  if vp.isDockedActive() and vp.paintPending and (immediate or getMonoTime() >= vp.nextPaint):
+    vp.paintPending = false
+    vp.paintScreen()
+    vp.nextPaint = getMonoTime() + initDuration(milliseconds = FrameIntervalMs)
 
 proc redrawDock*(vp: DockViewport, commitLinesFirst: openArray[string] = []) =
-  ## Commit permanent transcript rows, then repaint the docked input bar and status line.
+  ## Update transcript state and request one repaint at the next frame boundary.
   if vp.isNil:
     return
   if not vp.fullScreen:
@@ -252,8 +258,15 @@ proc redrawDock*(vp: DockViewport, commitLinesFirst: openArray[string] = []) =
       stdout.flushFile()
     return
   vp.transcript.addLines(commitLinesFirst)
-  if vp.isDockedActive():
-    vp.paintScreen()
+  vp.transcript.setTail(vp.activeTailLines)
+  vp.paintPending = true
+  vp.flushPaint()
+
+proc refreshWorkingPaint(vp: DockViewport) =
+  if terminalSize() != vp.drawnSize or
+      (vp.workingPhase.len > 0 and vp.elapsedWorkingSeconds() != vp.drawnWorkingSecond):
+    vp.redrawDock()
+  vp.flushPaint()
 
 proc suspendDock*(vp: DockViewport) =
   ## Clear the fixed layout so a modal selector (`/model`, `ask_question`, `/login`) can render from the top.
@@ -272,18 +285,16 @@ proc resumeDock*(vp: DockViewport) =
   vp.gitBranch = detectGitBranch(vp.rt.cfg.cwd)
   vp.drawnFrame.setLen(0)
   vp.redrawDock()
+  vp.flushPaint(immediate = true)
 
 proc applyScrollKey*(vp: DockViewport, ev: KeyEvent): bool =
   ## Handle transcript scrolling keys; returns true when the key was consumed.
   if vp.isNil or not vp.fullScreen or vp.suspended:
     return false
-  let (_, rows) = terminalSize()
-  let page = max(1, rows - 8)
   case ev.kind
-  of kkPageUp:
-    vp.transcript.scrollBy(page)
-  of kkPageDown:
-    vp.transcript.scrollBy(-page)
+  of kkPageUp, kkPageDown:
+    let page = max(1, terminalSize().rows - 8)
+    vp.transcript.scrollBy(if ev.kind == kkPageUp: page else: -page)
   of kkScrollUp:
     vp.transcript.scrollBy(3)
   of kkScrollDown:
@@ -298,11 +309,32 @@ proc applyScrollKey*(vp: DockViewport, ev: KeyEvent): bool =
     return false
   true
 
+proc pollDockKey(vp: DockViewport, timeoutMs: int): Option[KeyEvent] =
+  if vp.pendingKey.isSome:
+    result = vp.pendingKey
+    vp.pendingKey = none(KeyEvent)
+  else:
+    result = pollRawKeyNonBlocking(timeoutMs)
+
 proc handleDockKey(vp: DockViewport, ev: KeyEvent): Option[EditorOutcome] =
   if vp.applyScrollKey(ev):
+    if ev.kind in {kkScrollUp, kkScrollDown}:
+      # Trackpads can send many wheel reports per frame. Keep the first
+      # non-wheel key for the normal input loop.
+      let deadline = getMonoTime() + initDuration(milliseconds = 12)
+      for _ in 1 ..< 64:
+        let remaining = max(0, (deadline - getMonoTime()).inMilliseconds).int
+        let next = pollRawKeyNonBlocking(remaining)
+        if next.isNone:
+          break
+        if next.get.kind notin {kkScrollUp, kkScrollDown}:
+          vp.pendingKey = next
+          break
+        discard vp.applyScrollKey(next.get)
     return none(EditorOutcome)
-  if ev.kind == kkCtrlL:
+  if ev.kind == kkCtrlL and vp.isDockedActive():
     vp.drawnFrame.setLen(0)
+    return none(EditorOutcome)
   vp.ed.handleKeyEvent(ev)
 
 proc printAboveDock*(vp: DockViewport, lines: openArray[string]) =
@@ -311,9 +343,7 @@ proc printAboveDock*(vp: DockViewport, lines: openArray[string]) =
     return
   if vp.fullScreen:
     discard vp.transcript.beginSegment(segNotice)
-    vp.transcript.addLines(lines)
-    if vp.isDockedActive():
-      vp.paintScreen()
+    vp.redrawDock(lines)
     return
   for line in lines:
     stdout.writeLine(line)
@@ -409,6 +439,74 @@ proc renderThinkingLines(text: string, cols: int): seq[string] =
     let prefix = if i == 0: "  " & styleDim("💭 ") else: "     "
     result.add(wrapAnsiText(styleDim(line), max(28, cols - 4), firstIndent = prefix, contIndent = "     "))
 
+proc restoreTranscript(vp: DockViewport, banner: openArray[string] = []) =
+  let (cols, _) = terminalSize()
+  vp.transcript = newTranscript()
+  vp.activeTailLines.setLen(0)
+  vp.transcript.addLines(banner)
+  for entry in vp.rt.session.activeBranchEntries():
+    if entry.kind == sekCompaction:
+      discard vp.transcript.beginSegment(segNotice, "Context compacted")
+      vp.transcript.addLines(@[styleMagenta("  ⟳ Conversation compacted"), ""])
+    if entry.kind != sekMessage: continue
+    let msg = entry.message
+    case msg.role
+    of mrUser:
+      let text = stripAnsi(collectText(msg.userBlocks))
+      discard vp.transcript.beginSegment(segUser, promptTitle(text))
+      vp.transcript.addLines(renderUserPromptBlock(text, cols))
+    of mrAssistant:
+      let thinking = stripAnsi(collectThinking(msg.assistantBlocks))
+      if thinking.len > 0 and not vp.rt.cfg.settings.hideThinkingBlock:
+        discard vp.transcript.beginSegment(segThinking)
+        vp.transcript.addLines(renderThinkingLines(thinking, cols) & @[""])
+      let text = stripAnsi(collectText(msg.assistantBlocks))
+      if text.len > 0:
+        discard vp.transcript.beginSegment(segAssistant, msg.model)
+        vp.transcript.addLines(indentLines(renderMarkdown(text, max(20, cols - 4))) & @[""])
+      for call in collectToolCalls(msg.assistantBlocks):
+        discard vp.transcript.beginSegment(segTool, call.name)
+        let args = stripAnsi(summarizeToolArgs(call.name, call.arguments))
+        vp.transcript.addLines(@["  " & styleCyan("● " & stripAnsi(call.name)) & (if args.len > 0: " " & styleDim(args) else: "")])
+      if msg.errorMessage.len > 0:
+        discard vp.transcript.beginSegment(segNotice)
+        vp.transcript.addLines(@[styleRed("  ✗ " & stripAnsi(msg.errorMessage))])
+    of mrToolResult:
+      if msg.isError:
+        let output = stripAnsi(collectText(msg.resultBlocks)).splitLines()
+        if output.len > 0:
+          vp.transcript.addLines(@["    " & styleRed("✗ " & output[0])])
+      elif msg.diff.len > 0:
+        vp.transcript.addLines(formatColoredDiffLines(stripAnsi(msg.diff)))
+    of mrSystem:
+      discard
+  if vp.fullScreen: vp.redrawDock()
+  else: vp.redrawDock(vp.transcript.lines)
+
+proc pickSavedSession*(sessions: openArray[SessionSummaryInfo]): int =
+  var options: seq[QuestionOption]
+  for info in sessions:
+    options.add(QuestionOption(label: info.displayName,
+      description: info.id & " · " & $info.messageCount & " messages · " & info.timestamp))
+  selectSearchableOption("Resume session", options)
+
+proc runStopMessage(msg: AgentMessage): string =
+  case msg.stopReason
+  of srStop: ""
+  of srLength: "Model response reached its output limit"
+  of srTurnLimit: "Agent reached the limit of " & $MaxAgentTurnsPerRun & " turns"
+  of srAborted: "Run cancelled"
+  of srError: (if msg.errorMessage.len > 0: msg.errorMessage else: "Model request failed")
+  of srToolUse: "Run ended before the model completed its response"
+
+proc runExitCode(reason: StopReason): int =
+  case reason
+  of srStop: 0
+  of srError, srToolUse: 1
+  of srLength: 2
+  of srTurnLimit: 3
+  of srAborted: 130
+
 proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): AgentEventCallback =
   ## Build a streaming terminal renderer (dock-aware when vp != nil; standalone fallback otherwise).
   if vp.isNil:
@@ -451,11 +549,13 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
           renderColoredDiff(ev.toolOutput.diff)
       of aekTurnEnd:
         if inText: mdStream.finishStream(); inText = false
+      of aekRunEnd:
+        if ev.finalMessage.stopReason in {srLength, srTurnLimit, srToolUse}:
+          stdout.writeLine(styleYellow(runStopMessage(ev.finalMessage)))
       else: discard
 
   # Docked TUI streaming printer: streams rendered Markdown & tool calls above the fixed bottom input bar
   var thinkingBuf = ""
-  var thinkingChars = 0
   var inText = false
   var mdStream = newStreamMarkdownRenderer()
 
@@ -483,28 +583,32 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
     let maxErasable = rows - 1
 
     case ev.kind
+    of aekRunStart:
+      vp.setWorkingStatus("Thinking")
+
+    of aekMessage:
+      if ev.observedMessage.role == mrUser:
+        vp.redrawDock()
+
     of aekTurnStart:
       thinkingBuf = ""
-      thinkingChars = 0
       inText = false
       mdStream = newStreamMarkdownRenderer(max(28, cols - 4))
-      vp.setThinkingStatus(thinkingChars)
+      vp.setWorkingStatus("Thinking")
       vp.redrawDock()
 
     of aekStream:
       let sev = ev.streamEvent
       case sev.kind
       of sekThinkingDelta:
-        thinkingChars += sev.thinkingDelta.len
-        thinkingBuf.add(sev.thinkingDelta)
-        vp.setThinkingStatus(thinkingChars)
         if not hideThinking:
+          thinkingBuf.add(sev.thinkingDelta)
           let tailWrapped = renderThinkingLines(thinkingBuf, cols)
           if tailWrapped.len > maxErasable:
             vp.activeTailLines = tailWrapped[tailWrapped.len - maxErasable .. ^1]
           else:
             vp.activeTailLines = tailWrapped
-        vp.redrawDock()
+          vp.redrawDock()
 
       of sekTextDelta:
         if thinkingBuf.len > 0:
@@ -562,6 +666,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
         vp.redrawDock(commit)
 
     of aekCompaction:
+      if ev.summaryText.len == 0: return
       discard vp.transcript.beginSegment(segNotice)
       vp.redrawDock(@["  " & styleMagenta("⟳ Auto-compacted conversation (" & $ev.tokensBefore & " est. tokens summarized)")])
 
@@ -571,10 +676,19 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
       if inText:
         flushTextAboveDock()
 
+    of aekAssistantEnd:
+      vp.redrawDock()
+
     of aekRunEnd:
       vp.setWorkingStatus()
       vp.activeTailLines.setLen(0)
-      vp.redrawDock()
+      if ev.finalMessage.stopReason in {srLength, srTurnLimit, srToolUse}:
+        discard vp.transcript.beginSegment(segNotice)
+        vp.redrawDock(@["  " & styleYellow(runStopMessage(ev.finalMessage))])
+      else:
+        vp.redrawDock()
+      vp.flushPaint(immediate = true)
+    else: discard
 
 # Interactive Searchable `/model` Selector (aligned with Pi's ModelSelectorComponent)
 
@@ -778,57 +892,143 @@ proc interactiveSecurityPrompt*(action: PermissionAction, target: string, reason
 proc runPrintMode*(rt: AgentRuntime, prompt: string, explicitFiles: seq[string]): int =
   ## Run one prompt to completion, printing the final assistant text (Markdown-rendered when TTY, raw when piped).
   let finalMsg = rt.runPrompt(prompt, explicitFiles)
-  if finalMsg.stopReason == srError:
-    stderr.writeLine("Error: " & finalMsg.errorMessage)
-    return 1
-  let txt = collectText(finalMsg.assistantBlocks)
+  let exitCode = runExitCode(finalMsg.stopReason)
+  let txt = if finalMsg.stopReason == srError: "" else: collectText(finalMsg.assistantBlocks)
   if txt.len > 0:
     if colorsActive() and isStdoutTty():
       let (cols, _) = terminalSize()
       stdout.writeLine(renderMarkdownText(txt, max(40, cols - 2)))
     else:
       stdout.writeLine(txt)
-  0
+  if exitCode != 0:
+    stderr.writeLine("Error: " & runStopMessage(finalMsg))
+  exitCode
 
-proc emitAgentEventJson*(ev: AgentEvent) =
-  ## Serialize and write a single structured AgentEvent line to stdout (shared by `--mode json` and `--mode rpc`).
-  var rec = newJObject()
-  case ev.kind
-  of aekTurnStart:
-    rec = %*{ "type": "turn_start", "turn": ev.turnIndex, "model": ev.modelId }
-  of aekStream:
-    case ev.streamEvent.kind
-    of sekTextDelta:
-      rec = %*{ "type": "text_delta", "delta": ev.streamEvent.textDelta }
-    of sekThinkingDelta:
-      rec = %*{ "type": "thinking_delta", "delta": ev.streamEvent.thinkingDelta }
-    of sekError:
-      rec = %*{ "type": "error", "message": ev.streamEvent.errorMsg }
-    else:
-      return
-  of aekToolStart:
-    rec = %*{ "type": "tool_execution_start", "toolCallId": ev.toolCallId, "toolName": ev.toolName, "args": ev.toolArgs }
-  of aekToolEnd:
-    rec = %*{
-      "type": "tool_execution_end",
-      "toolCallId": ev.endToolCallId,
-      "toolName": ev.endToolName,
-      "isError": ev.toolOutput.isError,
-      "output": collectText(ev.toolOutput.content)
-    }
-  of aekCompaction:
-    rec = %*{ "type": "compaction", "tokensBefore": ev.tokensBefore }
-  of aekTurnEnd:
-    rec = %*{ "type": "turn_end", "message": ev.assistantMessage.toJson() }
-  of aekRunEnd:
-    rec = %*{ "type": "agent_end", "turns": ev.totalTurns, "stopReason": $ev.finalMessage.stopReason }
-  stdout.writeLine($rec)
+proc writeAgentJson(record: JsonNode) =
+  stdout.writeLine(encodeJsonUtf8(record))
   stdout.flushFile()
+
+proc makeJsonEventPrinter*(): AgentEventCallback =
+  ## Emit Pi's message and tool lifecycle while retaining Ni's legacy delta records.
+  var nextIndex = 0
+  var textIndex = -1
+  var thinkingIndex = -1
+  var toolIndexes = initTable[int, int]()
+  var usage = Usage()
+
+  let emit = writeAgentJson
+
+  proc update(event: JsonNode) =
+    emit(%*{"type": "message_update", "usage": usage.toJson(), "assistantMessageEvent": event})
+
+  return proc(ev: AgentEvent) =
+    case ev.kind
+    of aekRunStart:
+      emit(%*{"type": "agent_start"})
+    of aekTurnStart:
+      nextIndex = 0
+      textIndex = -1
+      thinkingIndex = -1
+      toolIndexes.clear()
+      usage = Usage()
+      emit(%*{"type": "turn_start", "turn": ev.turnIndex, "model": ev.modelId})
+      emit(%*{"type": "message_start", "message": {"role": "assistant", "content": [],
+        "model": ev.modelId, "stopReason": "pending", "timestamp": nowUnixMs()}})
+    of aekMessage:
+      let message = ev.observedMessage.toJson()
+      emit(%*{"type": "message_start", "message": message})
+      emit(%*{"type": "message_end", "message": message})
+    of aekAssistantEnd:
+      let message = ev.assistantMessage
+      let text = collectText(message.assistantBlocks)
+      let thinking = collectThinking(message.assistantBlocks)
+      if textIndex >= 0: update(%*{"type": "text_end", "contentIndex": textIndex, "content": text})
+      if thinkingIndex >= 0: update(%*{"type": "thinking_end", "contentIndex": thinkingIndex, "content": thinking})
+      emit(%*{"type": "message_end", "message": message.toJson()})
+    of aekStream:
+      let sev = ev.streamEvent
+      case sev.kind
+      of sekTextDelta:
+        if textIndex < 0:
+          textIndex = nextIndex
+          inc nextIndex
+          update(%*{"type": "text_start", "contentIndex": textIndex})
+        update(%*{"type": "text_delta", "contentIndex": textIndex, "delta": sev.textDelta})
+        emit(%*{"type": "text_delta", "delta": sev.textDelta})
+      of sekThinkingDelta:
+        if thinkingIndex < 0:
+          thinkingIndex = nextIndex
+          inc nextIndex
+          update(%*{"type": "thinking_start", "contentIndex": thinkingIndex})
+        update(%*{"type": "thinking_delta", "contentIndex": thinkingIndex, "delta": sev.thinkingDelta})
+        emit(%*{"type": "thinking_delta", "delta": sev.thinkingDelta})
+      of sekToolCallStart:
+        toolIndexes[sev.callIndex] = nextIndex
+        update(%*{"type": "toolcall_start", "contentIndex": nextIndex, "id": sev.callId, "toolName": sev.callName})
+        inc nextIndex
+      of sekToolCallDelta:
+        if toolIndexes.hasKey(sev.deltaIndex):
+          update(%*{"type": "toolcall_delta", "contentIndex": toolIndexes[sev.deltaIndex], "delta": sev.argumentsDelta})
+      of sekToolCallEnd:
+        if toolIndexes.hasKey(sev.endIndex):
+          update(%*{"type": "toolcall_end", "contentIndex": toolIndexes[sev.endIndex], "toolCall": sev.finishedCall.toJson()})
+      of sekDone:
+        usage = sev.usage
+      of sekError:
+        emit(%*{"type": "error", "message": sev.errorMsg})
+      of sekRetryStart:
+        emit(%*{"type": "auto_retry_start", "attempt": sev.retryAttempt, "maxAttempts": sev.retryLimit,
+          "delayMs": sev.retryDelayMs, "errorMessage": sev.retryError})
+      of sekRetryEnd:
+        let event = %*{"type": "auto_retry_end", "success": sev.retryError.len == 0, "attempt": sev.retryAttempt}
+        if sev.retryError.len > 0: event["finalError"] = %sev.retryError
+        emit(event)
+      of sekStart:
+        discard
+    of aekToolStart:
+      emit(%*{"type": "tool_execution_start", "toolCallId": ev.toolCallId,
+        "toolName": ev.toolName, "args": ev.toolArgs})
+    of aekToolUpdate:
+      emit(%*{"type": "tool_execution_update", "toolCallId": ev.updateToolCallId, "toolName": ev.updateToolName,
+        "args": ev.updateToolArgs, "partialResult": {"content": [textBlock(ev.partialOutput).toJson()]}})
+    of aekToolEnd:
+      var content = newJArray()
+      for blockItem in ev.toolOutput.content: content.add(blockItem.toJson())
+      emit(%*{"type": "tool_execution_end", "toolCallId": ev.endToolCallId, "toolName": ev.endToolName,
+        "isError": ev.toolOutput.isError, "output": collectText(ev.toolOutput.content), "durationMs": ev.toolDurationMs,
+        "result": {"content": content}})
+    of aekCompactionStart:
+      emit(%*{"type": "compaction_start", "reason": ev.compactionReason})
+    of aekCompaction:
+      let event = %*{"type": "compaction_end", "reason": ev.compactionReason,
+        "aborted": ev.compactionAborted, "willRetry": ev.summaryText.len > 0 and ev.compactionReason == "overflow"}
+      if ev.summaryText.len > 0:
+        event["result"] = %*{"summary": ev.summaryText, "firstKeptEntryId": ev.firstKeptId, "tokensBefore": ev.tokensBefore,
+          "estimatedTokensAfter": ev.estimatedTokensAfter, "usage": ev.compactionUsage.toJson()}
+      if ev.compactionError.len > 0: event["errorMessage"] = %ev.compactionError
+      emit(event)
+    of aekTurnEnd:
+      var results = newJArray()
+      for message in ev.turnToolResults: results.add(message.toJson())
+      emit(%*{"type": "turn_end", "message": ev.assistantMessage.toJson(), "toolResults": results})
+    of aekQueueUpdate:
+      emit(%*{"type": "queue_update", "steering": ev.queuedSteering, "followUp": ev.queuedFollowUps})
+    of aekRunEnd:
+      var messages = newJArray()
+      for message in ev.runMessages: messages.add(message.toJson())
+      let reason = ev.finalMessage.stopReason
+      let ended = %*{"type": "agent_end", "messages": messages, "willRetry": false,
+        "turns": ev.totalTurns, "stopReason": $reason, "exitCode": runExitCode(reason)}
+      if reason != srStop:
+        ended["errorMessage"] = %runStopMessage(ev.finalMessage)
+      emit(ended)
+      emit(%*{"type": "agent_settled", "aborted": ev.finalMessage.stopReason == srAborted})
 
 proc runJsonMode*(rt: AgentRuntime, prompt: string, explicitFiles: seq[string]): int =
   ## Run one prompt to completion, emitting structured JSONL agent events on stdout.
-  let finalMsg = rt.runPrompt(prompt, explicitFiles, onEvent = emitAgentEventJson)
-  if finalMsg.stopReason == srError: 1 else: 0
+  writeAgentJson(rt.session.sessionHeaderToJson())
+  let finalMsg = rt.runPrompt(prompt, explicitFiles, onEvent = makeJsonEventPrinter())
+  runExitCode(finalMsg.stopReason)
 
 # Slash command handlers
 
@@ -977,21 +1177,18 @@ proc handleModelSlash(rt: AgentRuntime, arg: string, vp: DockViewport) =
     applyChosenModel(rt, pick.chosenModel, saveDefault = pick.saveAsDefault, vp = vp)
 
 proc reloadRuntimeResources(rt: AgentRuntime, vp: DockViewport) =
-  let trusted = rt.cfg.projectTrusted
-  let newCfg = loadConfigBundle(rt.cfg.cwd, rt.cfg.agentDir, projectTrusted = trusted)
+  let newCfg = loadRuntimeConfig(rt.cfg.cwd, rt.cfg.agentDir, rt.cfg.projectTrusted, rt.configOverrides)
   rt.cfg = newCfg
+  rt.security.mode = newCfg.settings.securityMode
   rt.providerRegistry = newProviderRegistry(newCfg, rt.providerRegistry.transport)
   if not rt.mcpManager.isNil:
     rt.mcpManager.closeAll()
-  let newToolReg = newToolRegistry(newCfg.settings.defaultTools)
-  let newMcp = newMcpManager(newCfg, newToolReg, connectNow = true)
-  let (newSkills, skillDiags) = discoverSkills(newCfg.cwd, newCfg.agentDir, newCfg.settings.skills, projectTrusted = trusted)
-  let (newTpls, tplDiags) = discoverPromptTemplates(newCfg.cwd, newCfg.agentDir, newCfg.settings.prompts, projectTrusted = trusted)
+  let (newToolReg, newMcp) = configureRuntimeTools(newCfg, rt.toolOverrides, rt.noTools, rt.noMcp, rt.security)
+  let (newSkills, newTpls, resourceDiags) = discoverRuntimeResources(newCfg, rt.configOverrides)
   rt.toolRegistry = newToolReg
   rt.mcpManager = newMcp
   rt.skills = newSkills
   rt.promptTemplates = newTpls
-  rt.security.mode = newCfg.settings.securityMode
   vp.ed.commands = buildSlashCommandDefs(rt)
   vp.ed.modelItems = buildModelAutocompleteItems(rt)
   vp.followUpKeys = loadFollowUpKeys(newCfg.agentDir)
@@ -999,7 +1196,7 @@ proc reloadRuntimeResources(rt: AgentRuntime, vp: DockViewport) =
   var lines = @["  " & styleGreen("✓ Reloaded config: ") &
                 $newSkills.len & " skill(s), " & $newTpls.len & " prompt template(s), " &
                 $newMcp.servers.len & " MCP server(s)."]
-  for d in newCfg.diagnostics & skillDiags & tplDiags & newMcp.diagnostics:
+  for d in newCfg.diagnostics & resourceDiags & newMcp.diagnostics:
     lines.add("    " & styleYellow("! " & d))
   vp.printAboveDock(lines)
 
@@ -1008,8 +1205,7 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
   let rt = vp.rt
   let runAbort = newAbortFlag()
   activeRunAbort = runAbort
-  vp.turnStartMs = nowUnixMs()
-  var lastSpinnerTick = 0'i64
+  vp.workingStarted = getMonoTime()
 
   # Wrap ask_question & security prompt so modal selectors cleanly suspend/resume the docked bar
   let origAsk = rt.askQuestion
@@ -1033,7 +1229,7 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
   rt.providerRegistry.onIdleTick = proc() =
     # Poll non-blocking user keys while waiting on LLM SSE stream
     while true:
-      let kevOpt = pollRawKeyNonBlocking(0)
+      let kevOpt = vp.pollDockKey(0)
       if kevOpt.isNone:
         break
       let kev = kevOpt.get
@@ -1055,10 +1251,7 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
             rt.steeringQueue.add(QueuedPrompt(text: outOpt.get.text))
       vp.redrawDock()
 
-    let spinnerTick = vp.elapsedMilliseconds() div SpinnerIntervalMs
-    if terminalSize() != vp.drawnSize or (vp.workingPhase.len > 0 and spinnerTick != lastSpinnerTick and not runAbort.aborted):
-      lastSpinnerTick = spinnerTick
-      vp.redrawDock()
+    vp.refreshWorkingPaint()
 
   defer:
     rt.providerRegistry.onIdleTick = nil
@@ -1083,7 +1276,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
   let interactive = isInteractiveTerminal()
 
   var banner: seq[string] = @[]
-  banner.add(styleBold(styleCyan(NiEmoji & " ni v0.2.0")) & styleDim(" — Fast Nim coding agent (Pi config compatible)"))
+  banner.add(styleBold(styleCyan(NiEmoji & " ni v" & NiVersion)) & styleDim(" — Fast Nim coding agent (Pi config compatible)"))
   banner.add(
     styleDim("  Model     : ") & styleCyan(rt.currentModel.provider & "/" & rt.currentModel.id) &
                    styleDim(" (" & rt.currentModel.name & ")") &
@@ -1118,7 +1311,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         exitFullScreen()
       exitRawTerminalMode()
 
-  vp.redrawDock(banner)
+  vp.restoreTranscript(banner)
   if initialPrompt.strip().len > 0 or initialFiles.len > 0:
     let (cols, _) = terminalSize()
     if initialPrompt.strip().len > 0:
@@ -1143,7 +1336,10 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
 
   # Main persistent docked TUI loop
   while true:
-    let event = pollRawKeyNonBlocking(100)
+    vp.flushPaint()
+    let waitMs = if vp.isDockedActive() and vp.paintPending:
+      max(1, (vp.nextPaint - getMonoTime()).inMilliseconds + 1).int else: 100
+    let event = vp.pollDockKey(waitMs)
     if event.isNone:
       if vp.fullScreen and terminalSize() != vp.drawnSize:
         vp.redrawDock()
@@ -1195,13 +1391,26 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         continue
       discard vp.transcript.beginSegment(segNotice, "$ " & shCmd)
       vp.redrawDock(@["  " & styleCyan("$ " & shCmd)])
-      let (exe, baseArgs) = resolveBashShell(rt.cfg.settings.shellPath)
       let runAbort = newAbortFlag()
       activeRunAbort = runAbort
-      vp.turnStartMs = nowUnixMs()
+      runAbort.onIdle = proc() =
+        let key = vp.pollDockKey(0)
+        if key.isSome:
+          if key.get.kind in {kkEscape, kkCtrlC, kkEof}: runAbort.aborted = true
+          elif key.get.kind notin {kkEnter, kkAltEnter}:
+            discard vp.handleDockKey(key.get)
+            vp.redrawDock()
+        vp.refreshWorkingPaint()
+      vp.workingStarted = getMonoTime()
       vp.setWorkingStatus("Running shell", shCmd)
       vp.redrawDock()
-      let res = runProcessCapture(exe, baseArgs & @[shCmd], rt.cfg.cwd, nil, 0.0, runAbort)
+      let res = try:
+        runUserShell(shCmd, rt.cfg.cwd, rt.cfg.settings, rt.security, runAbort)
+      except CatchableError as e:
+        activeRunAbort = nil
+        vp.setWorkingStatus()
+        vp.printAboveDock("  " & styleRed(e.msg))
+        continue
       activeRunAbort = nil
       vp.setWorkingStatus()
       var outLines: seq[string] = @[]
@@ -1211,12 +1420,12 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       if res.exitCode != 0:
         outLines.add("  " & styleYellow("[exit code " & $res.exitCode & "]"))
       outLines.add("")
-      vp.printAboveDock(outLines)
       if not excludeCtx:
         let trunc = truncateHead(res.output.replace("\r\n", "\n"))
         discard rt.session.appendMessage(newUserMessage(
           "<user_shell command=\"" & shCmd & "\" exit_code=\"" & $res.exitCode & "\">\n" & trunc.content & "\n</user_shell>"
         ))
+      vp.printAboveDock(outLines)
       ed.invalidateFileCache()
       continue
 
@@ -1317,8 +1526,35 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
           lines.add("")
           vp.printAboveDock(lines)
       of "/mcp":
-        if arg.toLowerAscii() == "reconnect":
+        let words = arg.splitWhitespace()
+        let mcpAction = if words.len > 0: words[0].toLowerAscii() else: "list"
+        if mcpAction == "reconnect":
           reloadRuntimeResources(rt, vp)
+        elif mcpAction in ["login", "logout", "enable", "disable"]:
+          if words.len < 2 or words.len > 3:
+            vp.printAboveDock("  " & styleYellow("Usage: /mcp " & mcpAction & " <server> [tool]"))
+            continue
+          try:
+            let server = findMcpConfig(rt.cfg, words[1])
+            case mcpAction
+            of "login":
+              vp.suspendDock()
+              exitRawTerminalMode()
+              try:
+                signInMcp(rt.cfg, server, announce = proc(url: string) =
+                  stdout.writeLine("Authorize in a browser: " & url)
+                  stdout.flushFile())
+              finally:
+                enterRawTerminalMode()
+                vp.resumeDock()
+            of "logout":
+              signOutMcp(rt.cfg, server)
+            else:
+              let tool = if words.len == 3: words[2] else: ""
+              setMcpEnabled(rt.cfg, server, mcpAction == "enable", tool)
+            reloadRuntimeResources(rt, vp)
+          except CatchableError as e:
+            vp.printAboveDock("  " & styleRed(e.msg))
         elif rt.mcpManager.servers.len == 0:
           vp.printAboveDock("  " & styleDim("No MCP servers configured (~/.pi/agent/mcp.json or .pi/mcp.json)."))
         else:
@@ -1331,19 +1567,15 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
             lines.add("  • " & styleBold(sname) & " [" & stColor & ", " & $sess.config.transportKind &
                       ", exposure=" & $sess.config.exposure & ", tools=" & $sess.remoteTools.len & "]")
             if sess.lastError.len > 0:
-              lines.add("    " & styleRed("Error: " & sess.lastError))
+              lines.add("    " & styleRed($sess.failureKind & ": " & sess.lastError))
           lines.add("")
           vp.printAboveDock(lines)
       of "/tools":
-        if arg.len > 0:
+        if arg.len > 0 and not rt.noTools:
           let parts = arg.split({',', ' '})
-          var curList: seq[string] = @[]
-          for n in rt.toolRegistry.activeNames: curList.add(n)
-          let updated = applyToolListSpec(curList, parts)
-          rt.toolRegistry.activeNames.clear()
-          for n in updated:
-            if rt.toolRegistry.tools.hasKey(n):
-              rt.toolRegistry.activeNames.incl(n)
+          rt.toolOverrides.add(parts)
+          rt.toolRegistry.applyToolOverrides(parts)
+          vp.contextRevision.session = nil
         var lines: seq[string] = @[]
         for tname, t in rt.toolRegistry.tools.pairs:
           let mark = if tname in rt.toolRegistry.activeNames: styleGreen("●") else: styleDim("○")
@@ -1384,8 +1616,8 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
           rt.session.appendSessionName(arg)
           vp.printAboveDock("  " & styleGreen("✓ Session named: ") & arg)
       of "/new":
-        let sessionsRoot = resolveSessionsRoot(rt.cfg)
-        rt.session = newSessionManager(rt.cfg.cwd, sessionsRoot, persist = rt.session.persist)
+        rt.switchSession(newSessionManager(rt.cfg.cwd, rt.sessionsRoot, persist = rt.session.persist))
+        vp.restoreTranscript()
         vp.printAboveDock("  " & styleGreen("✓ Started new session ") & styleBold(rt.session.id))
       of "/tree":
         let items = rt.session.buildSessionTreeItems()
@@ -1399,22 +1631,17 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
             let indent = "  ".repeat(min(6, item.depth))
             let leafTag = if item.isCurrentLeaf: " ← current" elif item.isActivePath: " ●" else: ""
             opts.add(QuestionOption(label: indent & "[" & item.entryId & "] " & item.roleLabel & leafTag, description: item.preview))
-          let ans = promptQuestionWidget(AskQuestionItem(
-            id: "session_tree",
-            header: "Session Tree",
-            question: "Select an entry to branch from:",
-            options: opts,
-            multiSelect: false,
-            allowOther: false
-          ))
+          let chosen = selectSearchableOption("Session tree", opts)
           enterRawTerminalMode()
           vp.resumeDock()
-          if not ans.cancelled and ans.selected.len > 0:
-            for i, opt in opts.pairs:
-              if opt.label == ans.selected[0]:
-                if rt.session.branchTo(items[i].entryId):
-                  vp.printAboveDock("  " & styleGreen("✓ Switched branch leaf to ") & styleBold(items[i].entryId))
-                break
+          if chosen >= 0:
+            try:
+              if rt.session.branchTo(items[chosen].entryId):
+                rt.restoreSessionState()
+                vp.restoreTranscript()
+                vp.printAboveDock("  " & styleGreen("✓ Switched branch leaf to ") & styleBold(items[chosen].entryId))
+            except CatchableError as e:
+              vp.printAboveDock("  " & styleRed(e.msg))
       of "/fork":
         var targetId = arg.strip()
         if targetId.len == 0:
@@ -1444,9 +1671,12 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
               if opt.label == ans.selected[0]:
                 targetId = entryIds[i]
                 break
-        let forked = rt.session.forkSessionAtEntry(targetId, resolveSessionsRoot(rt.cfg))
-        rt.session = forked
-        vp.printAboveDock("  " & styleGreen("✓ Forked into new session ") & styleBold(forked.id))
+        try:
+          rt.switchSession(rt.session.forkSessionAtEntry(targetId, rt.sessionsRoot))
+          vp.restoreTranscript()
+          vp.printAboveDock("  " & styleGreen("✓ Forked into new session ") & styleBold(rt.session.id))
+        except IOError, OSError:
+          vp.printAboveDock("  " & styleRed(getCurrentExceptionMsg()))
       of "/export":
         try:
           let written = rt.session.exportSessionToFile(arg)
@@ -1454,38 +1684,32 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         except CatchableError as e:
           vp.printAboveDock("  " & styleRed("Failed to export session: " & e.msg))
       of "/resume":
-        let sessions = listSessions(resolveSessionsRoot(rt.cfg), rt.cfg.cwd)
+        let sessions = listSessions(rt.sessionsRoot, rt.cfg.cwd)
         if sessions.len == 0:
           vp.printAboveDock("  " & styleYellow("No saved sessions found for this workspace."))
         else:
           vp.suspendDock()
           exitRawTerminalMode()
-          var opts: seq[QuestionOption] = @[]
-          let cnt = min(15, sessions.len)
-          for i in 0 ..< cnt:
-            let s = sessions[i]
-            opts.add(QuestionOption(label: s.displayName, description: s.id[0 ..< min(8, s.id.len)] & " · " & $s.messageCount & " msgs"))
-          let pick = promptQuestionWidget(AskQuestionItem(
-            id: "resume_session",
-            header: "Sessions",
-            question: "Select a session to resume:",
-            options: opts,
-            multiSelect: false,
-            allowOther: false
-          ))
+          let chosen = pickSavedSession(sessions)
           enterRawTerminalMode()
           vp.resumeDock()
-          if not pick.cancelled and pick.selected.len > 0:
-            for i in 0 ..< cnt:
-              if opts[i].label == pick.selected[0]:
-                rt.session = loadSessionFile(sessions[i].filePath)
-                vp.printAboveDock("  " & styleGreen("✓ Resumed session ") & sessions[i].id)
-                break
+          if chosen >= 0:
+            try:
+              rt.switchSession(rt.session.reopenSession(sessions[chosen].filePath))
+              vp.restoreTranscript()
+              vp.printAboveDock("  " & styleGreen("✓ Resumed session ") & rt.session.id)
+              for diagnostic in rt.session.diagnostics:
+                vp.printAboveDock("  " & styleYellow(diagnostic))
+            except IOError, OSError:
+              vp.printAboveDock("  " & styleRed(getCurrentExceptionMsg()))
       of "/compact":
-        vp.turnStartMs = nowUnixMs()
+        vp.workingStarted = getMonoTime()
         vp.setWorkingStatus("Compacting", "summarizing older context")
         vp.redrawDock()
-        let res = rt.compactSession(force = true)
+        vp.flushPaint(immediate = true)
+        let compactAbort = newAbortFlag()
+        compactAbort.onIdle = proc() = vp.refreshWorkingPaint()
+        let res = rt.compactSession(force = true, abort = compactAbort)
         vp.setWorkingStatus()
         if res.isSome:
           vp.printAboveDock("  " & styleGreen("✓ Compacted session history."))
@@ -1493,6 +1717,8 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
           vp.printAboveDock("  " & styleYellow("Nothing to compact (conversation is short or compaction failed)."))
       of "/clear":
         discard rt.session.branchTo("")
+        rt.restoreSessionState()
+        vp.restoreTranscript()
         vp.printAboveDock("  " & styleGreen("✓ Started a clean conversation branch."))
       of "/reload":
         reloadRuntimeResources(rt, vp)

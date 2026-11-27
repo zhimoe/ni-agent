@@ -96,7 +96,7 @@ suite "Provider SSE Streaming, Session Tree, and Multi-turn Agent Loop":
 
     # Verify Pi v3 JSONL session reload, fork, and compaction
     check fileExists(sess.filePath)
-    let reloaded = loadSessionFile(sess.filePath)
+    let reloaded = loadSessionFile(sess.filePath, persist = false)
     let (reloadedMsgs, _, _) = reloaded.buildActiveContext()
     check reloadedMsgs.len == 6 # user -> assistant(ask) -> toolResult -> assistant(write) -> toolResult -> assistant(done)
 
@@ -133,7 +133,7 @@ suite "Provider SSE Streaming, Session Tree, and Multi-turn Agent Loop":
     let legacyJsonl = saved.replace(escapeJson(validOutput), escapeJson(legacyOutput))
     require legacyJsonl != saved
     writeFile(sess.filePath, legacyJsonl)
-    let (messages, _, _) = loadSessionFile(sess.filePath).buildActiveContext()
+    let (messages, _, _) = loadSessionFile(sess.filePath, persist = false).buildActiveContext()
     require messages.len == 3
     check collectText(messages[^1].resultBlocks) == validOutput
     check readFile(sess.filePath) == legacyJsonl
@@ -163,9 +163,70 @@ suite "Provider SSE Streaming, Session Tree, and Multi-turn Agent Loop":
       messages = liveMessages, tools = @[], thinkingLevel = tlOff, cliApiKey = "test-key")
     check liveReply.stopReason == srStop
     let exported = sess.exportSessionToFile(tmp / "export.jsonl")
-    let (exportedMessages, _, _) = loadSessionFile(exported).buildActiveContext()
+    let (exportedMessages, _, _) = loadSessionFile(exported, persist = false).buildActiveContext()
     require exportedMessages.len == 3
     check escapeJson(validOutput) in readFile(exported)
+
+  test "Context overflow compacts once and preserves all results for the retained tool call":
+    let tmp = getTempDir() / ("ni_overflow_" & $nowUnixMs())
+    createDir(tmp)
+    defer: removeDir(tmp)
+    let sess = newSessionManager(tmp, tmp / "sessions", persist = false)
+    discard sess.appendMessage(newUserMessage(repeat("old context ", 120)))
+    discard sess.appendMessage(AgentMessage(role: mrAssistant, assistantBlocks: @[textBlock("Earlier reply")]))
+    discard sess.appendMessage(AgentMessage(role: mrAssistant, assistantBlocks: @[
+      toolCallBlock("first_call", "read", %*{"path": "first"}),
+      toolCallBlock("second_call", "read", %*{"path": "second"})]))
+    for id in ["first_call", "second_call"]:
+      discard sess.appendMessage(newToolResultMessage(id, "read", ToolOutput(content: @[textBlock(id)])))
+    var requests: seq[JsonNode]
+    let transport: HttpStreamTransport = proc(url, httpMethod: string, headers: Table[string, string],
+        body, proxyUrl: string, timeoutMs: int, abort: AbortFlag,
+        onLine: HttpLineChunkCallback): HttpStreamResponse =
+      requests.add(parseJson(body)["messages"])
+      if requests.len == 1:
+        return HttpStreamResponse(statusCode: 400, errorBody: """{"error":{"message":"context_length_exceeded"}}""")
+      let text = if requests.len == 2: "Earlier work summarized" else: "Recovered"
+      onLine("data: " & $(%*{"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]}))
+      HttpStreamResponse(statusCode: 200)
+    let cfg = loadConfigBundle(tmp, tmp / "agent")
+    cfg.settings.compaction.keepRecentTokens = 250
+    let registry = newProviderRegistry(cfg, transport)
+    let (model, _) = registry.resolveModel(cfg, "deepseek/deepseek-flash", cliApiKey = "test-key")
+    let runtime = newAgentRuntime(cfg, registry, newToolRegistry(@[]),
+      McpManager(servers: initOrderedTable[string, McpServerSession]()), @[], newSecurityPolicy(tmp, cfg.agentDir),
+      sess, model, tlOff, cliApiKey = "test-key")
+    let reply = runtime.runPrompt("Continue")
+    check collectText(reply.assistantBlocks) == "Recovered"
+    require requests.len == 3
+    check "Earlier work summarized" in requests[^1][1]["content"].getStr()
+    check "old context" notin $requests[^1]
+    var resultIds: seq[string]
+    for index, message in requests[^1].elems:
+      if message{"role"}.getStr() == "tool":
+        if resultIds.len == 0:
+          check requests[^1][index - 1]["tool_calls"].len == 2
+        resultIds.add(message["tool_call_id"].getStr())
+    check resultIds == @["first_call", "second_call"]
+
+  test "A selected session branch persists until another entry is appended":
+    let tmp = getTempDir() / ("ni_leaf_" & $nowUnixMs())
+    createDir(tmp)
+    defer: removeDir(tmp)
+    let session = newSessionManager(tmp, tmp / "sessions")
+    let first = session.appendMessage(newUserMessage("First"))
+    let second = session.appendMessage(newUserMessage("Second"))
+    check session.branchTo(first)
+    let reopened = loadSessionFile(session.filePath, persist = false)
+    check reopened.leafId == first
+    require reopened.activeBranchEntries().len == 1
+    let external = session.filePath
+    let last = session.appendMessage(newUserMessage("Another branch"))
+    check loadSessionFile(external, persist = false).leafId == last
+    check session.branchTo(second)
+    check loadSessionFile(external, persist = false).leafId == second
+    check session.branchTo("")
+    check loadSessionFile(external, persist = false).activeBranchEntries().len == 0
 
   test "Steering batches attachments and file references before one-at-a-time follow-ups":
     let tmp = getTempDir() / ("ni_queue_" & $nowUnixMs())
@@ -215,6 +276,7 @@ suite "Provider SSE Streaming, Session Tree, and Multi-turn Agent Loop":
     createDir(tmp)
     defer: removeDir(tmp)
 
+    var truncated = false
     let mockResponsesTransport: HttpStreamTransport = proc(
       url, httpMethod: string,
       headers: Table[string, string],
@@ -227,7 +289,10 @@ suite "Provider SSE Streaming, Session Tree, and Multi-turn Agent Loop":
       onLine("""data: {"type":"response.reasoning_summary_text.delta","delta":"Checking..."}""")
       onLine("""data: {"type":"response.output_text.delta","delta":"Responses API "}""")
       onLine("""data: {"type":"response.output_text.delta","delta":"works!"}""")
-      onLine("""data: {"type":"response.completed","response":{"usage":{"input_tokens":50,"output_tokens":10,"total_tokens":60}}}""")
+      if truncated:
+        onLine("""data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":50,"output_tokens":10,"total_tokens":60}}}""")
+      else:
+        onLine("""data: {"type":"response.completed","response":{"usage":{"input_tokens":50,"output_tokens":10,"total_tokens":60}}}""")
       onLine("data: [DONE]")
       HttpStreamResponse(statusCode: 200)
 
@@ -249,3 +314,11 @@ suite "Provider SSE Streaming, Session Tree, and Multi-turn Agent Loop":
     check collectThinking(reply.assistantBlocks) == "Checking..."
     check collectText(reply.assistantBlocks) == "Responses API works!"
     check reply.usage.totalTokens == 60
+
+    truncated = true
+    let partialReply = provReg.streamCompletion(cfg = cfg, model = gpt5, systemPrompt = "",
+      messages = @[newUserMessage("Ping")], tools = @[], thinkingLevel = tlMedium,
+      cliApiKey = "sk-test-oai")
+    check partialReply.stopReason == srLength
+    check collectText(partialReply.assistantBlocks) == "Responses API works!"
+    check partialReply.usage.totalTokens == 60

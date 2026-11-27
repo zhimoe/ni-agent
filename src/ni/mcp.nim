@@ -1,17 +1,28 @@
 # Model Context Protocol (MCP) client: stdio & streamable HTTP transports, mcp.json config, tools, and resources.
 
-import std/[base64, hashes, httpclient, json, monotimes, options, os, osproc, sets, streams, strtabs, strutils, tables, times]
+import std/[asyncdispatch, asyncstreams, base64, hashes, httpclient, json, monotimes, options, os, osproc, sets, streams, strtabs, strutils, tables, tempfiles, times]
 when defined(windows):
   import std/winlean
 else:
   import std/posix
-import ./[types, config, tools, utf8]
+import ./[types, config, tools, trust, utf8, mcp_oauth, release_info]
 
 const
   McpProtocolVersion* = "2025-03-26"
   McpToolMaxTextBytes* = 20 * 1024
 
 type
+  McpAbortError = object of IOError
+  McpProtocolError = object of IOError
+  McpSessionExpired = object of IOError
+  McpAuthRejected = object of McpOAuthError
+
+  McpFailureKind* = enum
+    mcfNone = ""
+    mcfAuth = "authentication"
+    mcfNetwork = "network"
+    mcfProtocol = "protocol"
+
   McpTransportKind* = enum
     mtkStdio = "stdio"
     mtkHttp = "streamable-http"
@@ -31,6 +42,7 @@ type
     toolExposure*: OrderedTable[string, ToolExposure]
     description*: string
     source*: string
+    oauth*: McpOAuthOptions
 
   McpConnectionState* = enum
     mcsIdle = "idle"
@@ -49,6 +61,7 @@ type
     config*: McpServerConfig
     state*: McpConnectionState
     lastError*: string
+    failureKind*: McpFailureKind
     serverName*: string
     serverVersion*: string
     instructions*: string
@@ -61,8 +74,12 @@ type
     stderrTail*: string
     # Streamable HTTP state
     httpSessionId*: string
+    protocolVersion: string
     resolvedHeaders*: Table[string, string]
     proxyUrl*: string
+    oauthFile: string
+    bundle: ConfigBundle
+    security: SecurityPolicy
 
   McpManager* = ref object
     servers*: OrderedTable[string, McpServerSession]
@@ -200,6 +217,7 @@ proc mergeMcpFile(
       servers.del(canonicalMap[canon])
     canonicalMap[canon] = rawName
 
+    let oauth = entry{"oauth"}
     servers[rawName] = McpServerConfig(
       name: rawName,
       transportKind: tkind,
@@ -214,7 +232,11 @@ proc mergeMcpFile(
       exposure: srvExp,
       toolExposure: toolExp,
       description: entry{"description"}.getStr(""),
-      source: source
+      source: source,
+      oauth: McpOAuthOptions(clientId: oauth{"clientId"}.getStr(), clientSecret: oauth{"clientSecret"}.getStr(),
+        clientName: oauth{"clientName"}.getStr(), scope: oauth{"scope"}.getStr(),
+        metadataUrl: oauth{"authServerMetadataUrl"}.getStr(), callbackUrl: oauth{"callbackUrl"}.getStr(),
+        callbackPort: oauth{"callbackPort"}.getInt())
     )
 
 proc loadMcpConfigs*(cfg: ConfigBundle): tuple[servers: OrderedTable[string, McpServerConfig], diagnostics: seq[string]] =
@@ -228,6 +250,64 @@ proc loadMcpConfigs*(cfg: ConfigBundle): tuple[servers: OrderedTable[string, Mcp
     mergeMcpFile(servers, canonMap, cfg.cwd / ProjectConfigDirName / "mcp.json", "project", cfg.cwd, diags, isOverrideScope = true)
 
   (servers, diags)
+
+proc findMcpConfig*(cfg: ConfigBundle, name: string): McpServerConfig =
+  for serverName, server in loadMcpConfigs(cfg).servers.pairs:
+    if canonicalServerKey(serverName) == canonicalServerKey(name):
+      return server
+  raise newException(ValueError, "Unknown MCP server '" & name & "'")
+
+proc signInMcp*(cfg: ConfigBundle, server: McpServerConfig, openBrowser = true,
+                announce: proc(url: string) {.closure.}) =
+  if server.transportKind != mtkHttp:
+    raise newException(ValueError, "OAuth is available only for Streamable HTTP servers")
+  for key in server.headersRaw.keys:
+    if key.toLowerAscii() == "authorization":
+      raise newException(ValueError, "Remove the configured Authorization header before OAuth sign-in")
+  var options = server.oauth
+  if options.clientSecret.len > 0:
+    let resolved = resolveConfigValue(options.clientSecret, cfg.commandCache, cacheCommands = true)
+    if resolved.isNone:
+      raise newException(ValueError, "The configured OAuth client secret could not be resolved")
+    options.clientSecret = resolved.get
+  loginMcpOAuth(server.url, cfg.settings.httpProxy, oauthPath(cfg.agentDir, server.name, server.url),
+    options, openBrowser, announce)
+
+proc signOutMcp*(cfg: ConfigBundle, server: McpServerConfig) =
+  signOutOAuth(oauthPath(cfg.agentDir, server.name, server.url))
+
+proc setMcpEnabled*(cfg: ConfigBundle, server: McpServerConfig, enabled: bool, tool = "") =
+  let path = if server.source == "project": cfg.cwd / ProjectConfigDirName / "mcp.json"
+    else: cfg.agentDir / "mcp.json"
+  let root = parseJson(stripUtf8Bom(readFile(path)))
+  let servers = root{"mcpServers"}
+  if servers.isNil or servers.kind != JObject:
+    raise newException(ValueError, "MCP configuration does not contain a server map")
+  var entry: JsonNode
+  for name, node in servers.pairs:
+    if canonicalServerKey(name) == canonicalServerKey(server.name):
+      entry = node
+      break
+  if entry.isNil or entry.kind != JObject:
+    raise newException(ValueError, "MCP server configuration could not be found")
+  if tool.len == 0:
+    entry["enabled"] = %enabled
+  else:
+    if not entry.hasKey("toolExposure"): entry["toolExposure"] = newJObject()
+    if entry["toolExposure"].kind != JObject:
+      raise newException(ValueError, "MCP toolExposure must be an object")
+    entry["toolExposure"][tool] = %(if enabled: "direct" else: "hidden")
+  let permissions = getFilePermissions(path)
+  let (file, temporary) = createTempFile(".ni-mcp-", "", parentDir(path))
+  try:
+    try:
+      file.writeLine(encodeJsonUtf8(root))
+    finally:
+      file.close()
+    setFilePermissions(temporary, permissions)
+    moveFile(temporary, path)
+  finally:
+    if fileExists(temporary): removeFile(temporary)
 
 proc saveMcpServerEntry*(mcpFilePath: string, srv: McpServerConfig) =
   ## Add or replace one server entry inside mcp.json while preserving unrelated entries.
@@ -315,11 +395,13 @@ proc drainStderr(sess: McpServerSession) =
   if sess.stderrTail.len > 8192:
     sess.stderrTail = sess.stderrTail[sess.stderrTail.len - 8192 .. ^1]
 
-proc readStdioLine(sess: McpServerSession, timeoutMs: int): Option[string] =
+proc readStdioLine(sess: McpServerSession, timeoutMs: int, abort: AbortFlag): Option[string] =
   let start = getMonoTime()
   let outFd = sess.process.outputHandle()
 
   while true:
+    if abort.pollAbort():
+      raise newException(McpAbortError, "MCP request cancelled")
     let nl = sess.stdoutBuf.find('\n')
     if nl >= 0:
       var line = sess.stdoutBuf[0 ..< nl]
@@ -371,7 +453,7 @@ proc readStdioLine(sess: McpServerSession, timeoutMs: int): Option[string] =
 proc sendStdioJson(sess: McpServerSession, payload: JsonNode) =
   if sess.process.isNil or not sess.process.running():
     raise newException(IOError, "MCP stdio server '" & sess.config.name & "' is not running")
-  sess.process.inputStream.write($payload & "\n")
+  sess.process.inputStream.write(encodeJsonUtf8(payload) & "\n")
   sess.process.inputStream.flush()
 
 proc handleIncomingServerRequest(sess: McpServerSession, msg: JsonNode, workspaceRoot: string): Option[JsonNode] =
@@ -398,7 +480,7 @@ proc handleIncomingServerRequest(sess: McpServerSession, msg: JsonNode, workspac
       "error": { "code": -32601, "message": "Method not found: " & meth }
     })
 
-proc rpcRequestStdio(sess: McpServerSession, meth: string, params: JsonNode, workspaceRoot: string): JsonNode =
+proc rpcRequestStdio(sess: McpServerSession, meth: string, params: JsonNode, workspaceRoot: string, abort: AbortFlag): JsonNode =
   inc sess.nextReqId
   let myId = sess.nextReqId
   var req = %*{
@@ -412,8 +494,19 @@ proc rpcRequestStdio(sess: McpServerSession, meth: string, params: JsonNode, wor
   sess.sendStdioJson(req)
   let timeoutMs = sess.config.timeoutSec * 1000
 
+  let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
   while true:
-    let lineOpt = sess.readStdioLine(timeoutMs)
+    let remaining = (deadline - getMonoTime()).inMilliseconds.int
+    if remaining <= 0:
+      raise newException(IOError, "MCP stdio server '" & sess.config.name & "' timed out")
+    let lineOpt = try: sess.readStdioLine(remaining, abort)
+    except McpAbortError:
+      try:
+        sess.sendStdioJson(%*{"jsonrpc": "2.0", "method": "notifications/cancelled",
+          "params": {"requestId": myId, "reason": "Cancelled by user"}})
+      except CatchableError:
+        discard
+      raise
     if lineOpt.isNone:
       sess.drainStderr()
       let extra = if sess.stderrTail.strip().len > 0: ": " & sess.stderrTail.strip() else: ""
@@ -479,77 +572,125 @@ proc parseSseJsonRpcResponse*(sseBody: string, expectedId: int): Option[JsonNode
   flushEvent()
   found
 
-proc postMcpHttp(sess: McpServerSession, payload: JsonNode, expectResponse: bool): Option[JsonNode] =
+proc waitForMcpHttp[T](future: Future[T], deadline: MonoTime, abort: AbortFlag): T =
+  if abort.pollAbort():
+    raise newException(McpAbortError, "MCP request cancelled")
+  while not future.finished:
+    if abort.pollAbort():
+      raise newException(McpAbortError, "MCP request cancelled")
+    let remaining = (deadline - getMonoTime()).inMilliseconds.int
+    if remaining <= 0:
+      raise newException(IOError, "MCP HTTP request timed out")
+    discard waitFor withTimeout(future, min(50, remaining))
+  future.read()
+
+proc requestMcpHttp(sess: McpServerSession, payload: JsonNode, expectResponse: bool,
+                    token: string, abort: AbortFlag): Option[JsonNode] =
   var proxy: Proxy = nil
   if sess.proxyUrl.len > 0:
     proxy = newProxy(sess.proxyUrl)
 
-  var attempt = 0
-  while attempt < 3:
-    inc attempt
-    let client = newHttpClient(timeout = sess.config.timeoutSec * 1000, userAgent = "ni-mcp-client/0.1.0", proxy = proxy)
-    defer: client.close()
+  if abort.pollAbort():
+    raise newException(McpAbortError, "MCP request cancelled")
+  let client = newAsyncHttpClient(maxRedirects = 0, userAgent = "ni-mcp-client/" & NiVersion, proxy = proxy)
+  defer: client.close()
+  var hdrs = newHttpHeaders()
+  hdrs["Content-Type"] = "application/json"
+  hdrs["Accept"] = "application/json, text/event-stream"
+  if sess.protocolVersion.len > 0:
+    hdrs["MCP-Protocol-Version"] = sess.protocolVersion
+  for k, v in sess.resolvedHeaders.pairs: hdrs[k] = v
+  if token.len > 0: hdrs["Authorization"] = "Bearer " & token
+  if sess.httpSessionId.len > 0: hdrs["Mcp-Session-Id"] = sess.httpSessionId
+  let deadline = getMonoTime() + initDuration(seconds = sess.config.timeoutSec)
+  let resp = waitForMcpHttp(client.request(sess.config.url, httpMethod = HttpPost,
+    body = encodeJsonUtf8(payload), headers = hdrs), deadline, abort)
+  let code = resp.code.int
+  if code == 401:
+    raise newException(McpAuthRejected, "MCP authorization rejected. Sign in with ni mcp login " & sess.config.name)
+  if code == 403:
+    raise newException(McpOAuthError, "MCP access forbidden. Check the credential or sign in with the required scope.")
+  if code == 404 and sess.httpSessionId.len > 0:
+    raise newException(McpSessionExpired, "MCP server no longer recognizes this session")
+  if code < 200 or code >= 300:
+    let message = "MCP HTTP " & $code & " from '" & sess.config.name & "'"
+    if code < 500: raise newException(McpProtocolError, message)
+    raise newException(IOError, message)
+  let sessionId = resp.headers.getOrDefault("Mcp-Session-Id").strip()
+  if sessionId.len > 0: sess.httpSessionId = sessionId
+  if code == 202 or not expectResponse:
+    return none(JsonNode)
+  let isSse = "text/event-stream" in resp.headers.getOrDefault("Content-Type").toLowerAscii()
+  let expectedId = payload{"id"}.getInt(-1)
+  var rawBody = ""
+  while true:
+    let (more, chunk) = waitForMcpHttp(resp.bodyStream.read(), deadline, abort)
+    if not more: break
+    rawBody.add(chunk)
+    if isSse and ("\n\n" in rawBody or "\r\n\r\n" in rawBody):
+      let matched = parseSseJsonRpcResponse(rawBody, expectedId)
+      if matched.isSome: return matched
+  if isSse or rawBody.strip().startsWith("event:") or rawBody.strip().startsWith("data:"):
+    let matched = parseSseJsonRpcResponse(rawBody, expectedId)
+    if matched.isSome: return matched
+    raise newException(McpProtocolError, "MCP SSE stream from '" & sess.config.name & "' ended without matching JSON-RPC response")
+  try: some(parseJson(rawBody))
+  except CatchableError:
+    raise newException(McpProtocolError, "MCP server returned an invalid JSON response")
 
-    var hdrs = newHttpHeaders()
-    hdrs["Content-Type"] = "application/json"
-    hdrs["Accept"] = "application/json, text/event-stream"
-    for k, v in sess.resolvedHeaders.pairs:
-      hdrs[k] = v
-    if sess.httpSessionId.len > 0:
-      hdrs["Mcp-Session-Id"] = sess.httpSessionId
+proc postMcpHttp(sess: McpServerSession, payload: JsonNode, expectResponse: bool, abort: AbortFlag = nil): Option[JsonNode] =
+  let oauth = getOAuthToken(sess.oauthFile, sess.config.url, sess.proxyUrl, abort = abort)
+  try:
+    return requestMcpHttp(sess, payload, expectResponse, oauth.accessToken, abort)
+  except McpAuthRejected:
+    if oauth.refreshToken.len == 0: raise
+    let refreshed = getOAuthToken(sess.oauthFile, sess.config.url, sess.proxyUrl, force = true,
+      rejectedToken = oauth.accessToken, abort = abort)
+    return requestMcpHttp(sess, payload, expectResponse, refreshed.accessToken, abort)
 
-    let resp = client.request(sess.config.url, httpMethod = HttpPost, body = $payload, headers = hdrs)
-    let code = resp.code.int
+proc connectServer*(sess: McpServerSession, cfgBundle: ConfigBundle, security: SecurityPolicy = nil,
+                    abort: AbortFlag = nil)
 
-    if not resp.headers.isNil:
-      for hk, hv in resp.headers.table.pairs:
-        if hk.toLowerAscii() == "mcp-session-id" and hv.len > 0 and hv[0].len > 0:
-          sess.httpSessionId = hv[0].strip()
-
-    if code in [408, 429] or code >= 500:
-      if attempt < 3:
-        sleep(300 * attempt)
-        continue
-
-    if code == 202 or not expectResponse:
-      return none(JsonNode)
-
-    if code < 200 or code >= 300:
-      raise newException(IOError, "MCP HTTP " & $code & " from '" & sess.config.name & "': " & resp.body.strip())
-
-    var ctype = ""
-    if not resp.headers.isNil:
-      for hk, hv in resp.headers.table.pairs:
-        if hk.toLowerAscii() == "content-type" and hv.len > 0:
-          ctype = hv[0].toLowerAscii()
-    let rawBody = resp.body
-    if "text/event-stream" in ctype or rawBody.strip().startsWith("event:") or rawBody.strip().startsWith("data:"):
-      let expId = payload{"id"}.getInt(-1)
-      let matched = parseSseJsonRpcResponse(rawBody, expId)
-      if matched.isSome:
-        return matched
-      raise newException(IOError, "MCP SSE stream from '" & sess.config.name & "' ended without matching JSON-RPC response")
-
-    let parsed = parseJson(rawBody)
-    return some(parsed)
-  none(JsonNode)
-
-proc rpcRequest(sess: McpServerSession, meth: string, params: JsonNode, workspaceRoot: string): JsonNode =
+proc rpcRequest(sess: McpServerSession, meth: string, params: JsonNode, workspaceRoot: string, abort: AbortFlag = nil): JsonNode =
   case sess.config.transportKind
   of mtkStdio:
-    rpcRequestStdio(sess, meth, params, workspaceRoot)
+    rpcRequestStdio(sess, meth, params, workspaceRoot, abort)
   of mtkHttp:
     inc sess.nextReqId
     let myId = sess.nextReqId
     var req = %*{ "jsonrpc": "2.0", "id": myId, "method": meth }
     if not params.isNil:
       req["params"] = params
-    let respOpt = postMcpHttp(sess, req, expectResponse = true)
+    var respOpt: Option[JsonNode]
+    try:
+      try:
+        respOpt = postMcpHttp(sess, req, expectResponse = true, abort = abort)
+      except McpSessionExpired:
+        if sess.state != mcsConnected or sess.bundle.isNil: raise
+        sess.connectServer(sess.bundle, sess.security, abort)
+        if sess.state != mcsConnected:
+          raise newException(IOError, "MCP reconnect failed: " & sess.lastError)
+        respOpt = postMcpHttp(sess, req, expectResponse = true, abort = abort)
+    except McpAbortError:
+      if sess.state == mcsConnected:
+        let timeout = newAbortFlag()
+        let deadline = getMonoTime() + initDuration(milliseconds = 200)
+        timeout.onIdle = proc() =
+          if getMonoTime() >= deadline: timeout.aborted = true
+        try:
+          let token = loadOAuthToken(sess.oauthFile).accessToken
+          discard requestMcpHttp(sess, %*{"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": myId, "reason": "Cancelled by user"}}, false, token, timeout)
+        except CatchableError:
+          discard
+      raise
     if respOpt.isNone:
-      return newJObject()
+      raise newException(McpProtocolError, "MCP server accepted the request without returning a result")
     let msg = respOpt.get
+    if msg.kind != JObject or msg{"id"}.getInt(-1) != myId:
+      raise newException(McpProtocolError, "MCP server returned a mismatched JSON-RPC response")
     if msg.hasKey("error") and msg["error"].kind == JObject:
-      raise newException(IOError, "MCP '" & sess.config.name & "' " & meth & " error: " & msg["error"]{"message"}.getStr(""))
+      raise newException(McpProtocolError, "MCP '" & sess.config.name & "' " & meth & " error: " & msg["error"]{"message"}.getStr(""))
     if msg.hasKey("result"): msg["result"] else: newJObject()
 
 proc sendNotification(sess: McpServerSession, meth: string, params: JsonNode = nil) =
@@ -587,18 +728,23 @@ proc qualifyServerTools*(serverName: string, rawTools: seq[tuple[name, desc: str
       effectiveExposure: resolveEffectiveExposure(cfg, rt.name)
     ))
 
-proc connectServer*(sess: McpServerSession, cfgBundle: ConfigBundle) =
+proc connectServer*(sess: McpServerSession, cfgBundle: ConfigBundle, security: SecurityPolicy = nil,
+                    abort: AbortFlag = nil) =
   ## Start transport, run MCP initialize handshake, and fetch paginated tools/list.
   if not sess.config.enabled:
     sess.state = mcsDisabled
     return
 
+  sess.bundle = cfgBundle
+  sess.security = security
+  sess.state = mcsIdle
+  sess.httpSessionId = ""
+  sess.protocolVersion = ""
+  sess.remoteTools.setLen(0)
   try:
     case sess.config.transportKind
     of mtkStdio:
-      var envTable = newStringTable(modeCaseSensitive)
-      for k, v in envPairs():
-        envTable[k] = v
+      let envTable = security.processEnvironment()
       for ek, rawVal in sess.config.envRaw.pairs:
         let resolved = resolveConfigValue(rawVal, cfgBundle.commandCache, cacheCommands = true)
         if resolved.isSome:
@@ -609,11 +755,17 @@ proc connectServer*(sess: McpServerSession, cfgBundle: ConfigBundle) =
         else:
           {poUsePath}
       let runCwd = if dirExists(sess.config.cwd): sess.config.cwd else: cfgBundle.cwd
-      sess.process = startProcess(sess.config.command, workingDir = runCwd, args = sess.config.args, env = envTable, options = opts)
+      let denial = security.checkFileRead(runCwd)
+      if denial.len > 0:
+        raise newException(IOError, denial)
+      let (exe, args) = security.wrapProcess(sess.config.command, sess.config.args, runCwd)
+      sess.process = startProcess(exe, workingDir = runCwd, args = args, env = envTable, options = opts)
     of mtkHttp:
       sess.proxyUrl = cfgBundle.settings.httpProxy
       sess.resolvedHeaders = initTable[string, string]()
+      sess.oauthFile = oauthPath(cfgBundle.agentDir, sess.config.name, sess.config.url)
       for hk, rawVal in sess.config.headersRaw.pairs:
+        if hk.toLowerAscii() == "authorization": sess.oauthFile = ""
         let resolved = resolveConfigValue(rawVal, cfgBundle.commandCache, cacheCommands = true)
         if resolved.isSome:
           sess.resolvedHeaders[hk] = resolved.get
@@ -621,8 +773,9 @@ proc connectServer*(sess: McpServerSession, cfgBundle: ConfigBundle) =
     let initRes = sess.rpcRequest("initialize", %*{
       "protocolVersion": McpProtocolVersion,
       "capabilities": { "roots": { "listChanged": false } },
-      "clientInfo": { "name": "ni", "version": "0.1.0" }
-    }, cfgBundle.cwd)
+      "clientInfo": { "name": "ni", "version": NiVersion }
+    }, cfgBundle.cwd, abort)
+    sess.protocolVersion = initRes{"protocolVersion"}.getStr(McpProtocolVersion)
 
     if initRes.hasKey("serverInfo") and initRes["serverInfo"].kind == JObject:
       sess.serverName = initRes["serverInfo"]{"name"}.getStr(sess.config.name)
@@ -642,7 +795,7 @@ proc connectServer*(sess: McpServerSession, cfgBundle: ConfigBundle) =
       while pages < 50:
         inc pages
         let params = if cursor.len > 0: %*{ "cursor": cursor } else: newJObject()
-        let listRes = sess.rpcRequest("tools/list", params, cfgBundle.cwd)
+        let listRes = sess.rpcRequest("tools/list", params, cfgBundle.cwd, abort)
         if listRes.hasKey("tools") and listRes["tools"].kind == JArray:
           for tnode in listRes["tools"].items:
             if tnode.kind == JObject and tnode.hasKey("name"):
@@ -658,9 +811,13 @@ proc connectServer*(sess: McpServerSession, cfgBundle: ConfigBundle) =
     sess.remoteTools = qualifyServerTools(sess.config.name, rawTools, sess.config)
     sess.state = mcsConnected
     sess.lastError = ""
+    sess.failureKind = mcfNone
   except CatchableError as e:
     sess.state = mcsFailed
     sess.lastError = e.msg
+    sess.failureKind = if e of McpOAuthError: mcfAuth
+      elif e of McpProtocolError or e of ValueError: mcfProtocol
+      else: mcfNetwork
     if not sess.process.isNil:
       killProcessTree(sess.process)
       try: sess.process.close() except CatchableError: discard
@@ -682,12 +839,19 @@ proc closeServer*(sess: McpServerSession) =
   of mtkHttp:
     if sess.httpSessionId.len > 0:
       try:
-        let client = newHttpClient(timeout = 2000)
+        let proxy = if sess.proxyUrl.len > 0: newProxy(sess.proxyUrl) else: nil
+        let client = newHttpClient(maxRedirects = 0, timeout = 2000, proxy = proxy)
         defer: client.close()
+        for key, value in sess.resolvedHeaders.pairs:
+          client.headers[key] = value
+        let credentials = loadOAuthToken(sess.oauthFile)
+        if credentials.accessToken.len > 0:
+          client.headers["Authorization"] = "Bearer " & credentials.accessToken
         client.headers["Mcp-Session-Id"] = sess.httpSessionId
         discard client.request(sess.config.url, httpMethod = HttpDelete)
       except CatchableError:
         discard
+      sess.httpSessionId = ""
   if sess.state == mcsConnected:
     sess.state = mcsIdle
 
@@ -705,7 +869,8 @@ proc middleTruncateMcpText*(text, serverName: string): tuple[output: string, sav
     clipped.add("\n[Full MCP tool result saved to " & saved & "]")
   (clipped, saved)
 
-proc callMcpTool*(sess: McpServerSession, rawToolName: string, args: JsonNode, workspaceRoot: string): ToolOutput =
+proc callMcpTool*(sess: McpServerSession, rawToolName: string, args: JsonNode, workspaceRoot: string,
+                  abort: AbortFlag = nil): ToolOutput =
   ## Invoke tools/call on a connected MCP server and convert CallToolResult to ToolOutput.
   if sess.state != mcsConnected:
     return ToolOutput(
@@ -716,7 +881,7 @@ proc callMcpTool*(sess: McpServerSession, rawToolName: string, args: JsonNode, w
     let res = sess.rpcRequest("tools/call", %*{
       "name": rawToolName,
       "arguments": (if args.isNil: newJObject() else: args)
-    }, workspaceRoot)
+    }, workspaceRoot, abort)
 
     let isErr = res{"isError"}.getBool(false)
     var blocks: seq[ContentBlock] = @[]
@@ -753,6 +918,11 @@ proc callMcpTool*(sess: McpServerSession, rawToolName: string, args: JsonNode, w
 
     ToolOutput(content: blocks, isError: isErr, fullOutputPath: savedPath)
   except CatchableError as e:
+    if not (e of McpAbortError):
+      sess.lastError = e.msg
+      sess.failureKind = if e of McpOAuthError: mcfAuth
+        elif e of McpProtocolError or e of ValueError: mcfProtocol
+        else: mcfNetwork
     ToolOutput(content: @[textBlock("MCP call failed: " & e.msg)], isError: true)
 
 # Manager: connect servers, register tools & resource tools into ToolRegistry, build <mcp_servers> prompt section
@@ -783,7 +953,7 @@ proc registerMcpResourceTools(mgr: McpManager, reg: ToolRegistry, exposure: Tool
           continue
         try:
           let params = if cursor.len > 0: %*{ "cursor": cursor } else: newJObject()
-          let res = sess.rpcRequest("resources/list", params, mgr.workspaceRoot)
+          let res = sess.rpcRequest("resources/list", params, mgr.workspaceRoot, ctx.abort)
           if res.hasKey("resources") and res["resources"].kind == JArray:
             for item in res["resources"].items:
               if item.kind == JObject:
@@ -821,7 +991,7 @@ proc registerMcpResourceTools(mgr: McpManager, reg: ToolRegistry, exposure: Tool
       if sess.state != mcsConnected:
         return ToolOutput(content: @[textBlock("MCP server '" & sname & "' is not connected")], isError: true)
       try:
-        let res = sess.rpcRequest("resources/read", %*{ "uri": uri }, mgr.workspaceRoot)
+        let res = sess.rpcRequest("resources/read", %*{ "uri": uri }, mgr.workspaceRoot, ctx.abort)
         var blocks: seq[ContentBlock] = @[]
         if res.hasKey("contents") and res["contents"].kind == JArray:
           for c in res["contents"].items:
@@ -848,6 +1018,9 @@ proc registerMcpResourceTools(mgr: McpManager, reg: ToolRegistry, exposure: Tool
   if exposure == teDirect:
     reg.activeNames.incl(listTool.name)
     reg.activeNames.incl(readResTool.name)
+  else:
+    reg.discoverableNames.incl(listTool.name)
+    reg.discoverableNames.incl(readResTool.name)
 
 proc buildMcpAgentTool(sess: McpServerSession, rt: McpRemoteTool, serverName, workspaceRoot: string): AgentTool =
   let rawToolName = rt.rawName
@@ -860,10 +1033,10 @@ proc buildMcpAgentTool(sess: McpServerSession, rt: McpRemoteTool, serverName, wo
     exposure: rt.effectiveExposure,
     namespace: "mcp__" & sanitizeMcpIdent(serverName),
     execute: proc(args: JsonNode, ctx: ToolContext): ToolOutput =
-      callMcpTool(sess, rawToolName, args, workspaceRoot)
+      callMcpTool(sess, rawToolName, args, workspaceRoot, ctx.abort)
   )
 
-proc newMcpManager*(cfg: ConfigBundle, reg: ToolRegistry, connectNow = true): McpManager =
+proc newMcpManager*(cfg: ConfigBundle, reg: ToolRegistry, connectNow = true, security: SecurityPolicy = nil): McpManager =
   ## Load MCP configurations, connect enabled servers, and bind their tools into ToolRegistry.
   let (configs, diags) = loadMcpConfigs(cfg)
   result = McpManager(
@@ -882,7 +1055,7 @@ proc newMcpManager*(cfg: ConfigBundle, reg: ToolRegistry, connectNow = true): Mc
       state: (if scfg.enabled: mcsIdle else: mcsDisabled)
     )
     if connectNow and scfg.enabled:
-      sess.connectServer(cfg)
+      sess.connectServer(cfg, security)
       if sess.state == mcsFailed:
         result.diagnostics.add("MCP server '" & name & "' failed to connect: " & sess.lastError)
     result.servers[name] = sess
@@ -899,6 +1072,7 @@ proc newMcpManager*(cfg: ConfigBundle, reg: ToolRegistry, connectNow = true): Mc
         if rt.effectiveExposure == teDirect:
           reg.activeNames.incl(rt.qualifiedName)
         elif rt.effectiveExposure in {teDeferred, teCodemode}:
+          reg.discoverableNames.incl(rt.qualifiedName)
           needToolSearch = true
 
   if anyResources:
@@ -909,6 +1083,18 @@ proc newMcpManager*(cfg: ConfigBundle, reg: ToolRegistry, connectNow = true): Mc
   # Auto-enable tool_search when deferred/codemode MCP tools are present so any Pi mcp.json works seamlessly!
   if needToolSearch and reg.tools.hasKey("tool_search"):
     reg.activeNames.incl("tool_search")
+
+proc configureRuntimeTools*(cfg: ConfigBundle, overrides: seq[seq[string]],
+                            noTools, noMcp: bool, security: SecurityPolicy = nil):
+    tuple[tools: ToolRegistry, mcp: McpManager] =
+  result.tools = newToolRegistry(if noTools: @[] else: cfg.settings.defaultTools)
+  result.mcp = if noTools or noMcp:
+    McpManager(servers: initOrderedTable[string, McpServerSession](), workspaceRoot: cfg.cwd)
+  else:
+    newMcpManager(cfg, result.tools, security = security)
+  if not noTools:
+    for entries in overrides:
+      result.tools.applyToolOverrides(entries)
 
 proc closeAll*(mgr: McpManager) =
   ## Shut down all connected MCP servers cleanly.

@@ -2,8 +2,40 @@
 
 import std/[json, options, os, sets, strutils, tables, unittest]
 import ../src/ni/[types, config, trust, tools, skills, mcp, terminal_io]
+when defined(macosx) or defined(linux):
+  import ../src/ni/sandbox
 
 suite "Tools, Agent Skills, Live Stdio MCP Server, and Clipboard":
+  when defined(macosx) or defined(linux):
+    test "Restricted workspaces enforce native tool paths and Shell write modes":
+      if defined(linux) and findExe("bwrap").len == 0:
+        skip()
+      else:
+        let root = getTempDir() / ("ni_sandbox_" & $nowUnixMs())
+        let workspace = root / "workspace"
+        createDir(workspace)
+        defer: removeDir(root)
+        writeFile(root / "outside.txt", "outside")
+        writeFile(workspace / "inside.txt", "inside")
+        createSymlink(root / "missing.txt", workspace / "dangling.txt")
+        let registry = newToolRegistry(DefaultBuiltInTools)
+        for mode in [sandboxReadOnly, sandboxWorkspaceWrite]:
+          let policy = newSecurityPolicy(workspace, root / "agent", smPermissive)
+          policy.configureSandbox(mode)
+          defer: policy.closeSandbox()
+          let ctx = ToolContext(cwd: workspace, settings: defaultSettings(), security: policy, abort: newAbortFlag())
+          check registry.invokeTool("read", %*{"path": "inside.txt"}, ctx).isError == false
+          check registry.invokeTool("read", %*{"path": "../outside.txt"}, ctx).isError
+          check registry.invokeTool("write", %*{"path": "dangling.txt", "content": "denied"}, ctx).isError
+          check not fileExists(root / "missing.txt")
+          let writeInside = registry.invokeTool("write", %*{"path": "written.txt", "content": "yes"}, ctx)
+          check writeInside.isError == (mode == sandboxReadOnly)
+          let res = runUserShell("printf yes > shell-written.txt; printf no > ../shell-outside.txt",
+            workspace, ctx.settings, policy, ctx.abort)
+          check res.exitCode != 0
+          check fileExists(workspace / "shell-written.txt") == (mode == sandboxWorkspaceWrite)
+          check not fileExists(root / "shell-outside.txt")
+
   test "read, write, edit (BOM + CRLF preservation + uniqueness + diff), ls, find, grep, bash":
     let ws = getTempDir() / ("ni_tools_" & $nowUnixMs())
     createDir(ws)
@@ -249,6 +281,7 @@ for raw in sys.stdin:
       check collectText(sumOut.content) == "sum=42"
 
       # Discover & activate search_wiki through tool_search!
+      check toolReg.invokeTool("mcp__demo_srv__search_wiki", %*{"topic": "nim-orc"}, ctx).isError
       let searchOut = toolReg.invokeTool("tool_search", %*{ "query": "wiki articles" }, ctx)
       check not searchOut.isError
       check "mcp__demo_srv__search_wiki" in toolReg.activeNames
@@ -257,10 +290,15 @@ for raw in sys.stdin:
       check collectText(wikiOut.content) == "Wiki hit: nim-orc"
 
       # Read MCP resources!
+      let resources = toolReg.invokeTool("tool_search", %*{"query": "mcp resources"}, ctx)
+      check not resources.isError
       let resListOut = toolReg.invokeTool("list_mcp_resources", %*{}, ctx)
       check "memo://welcome" in collectText(resListOut.content)
       let resReadOut = toolReg.invokeTool("read_mcp_resource", %*{ "server": "demo-srv", "uri": "memo://welcome" }, ctx)
       check collectText(resReadOut.content) == "Hello from MCP resource!"
+      toolReg.applyToolOverrides(["-mcp__demo_srv__search_wiki"])
+      discard toolReg.invokeTool("tool_search", %*{"query": "wiki"}, ctx)
+      check toolReg.invokeTool("mcp__demo_srv__search_wiki", %*{"topic": "nim-orc"}, ctx).isError
 
       # Remove server config entry
       check removeMcpServerEntry(mcpJsonPath, "demo-srv") == true

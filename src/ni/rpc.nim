@@ -1,7 +1,7 @@
 # Headless JSONL RPC mode (`ni --mode rpc`) compatible with Pi's stdin/stdout embedding protocol.
 
 import std/[deques, json, options, strutils, tables]
-import ./[types, config, provider, tools, skills, session, agent, tui]
+import ./[types, config, provider, tools, skills, session, agent, tui, utf8]
 
 type
   RpcInputKind = enum
@@ -31,7 +31,7 @@ proc readRpcInput(input: ptr Channel[RpcInput]) {.thread.} =
     input[].send(RpcInput(kind: rikEof))
 
 proc writeRpcLine(node: JsonNode) =
-  stdout.writeLine($node)
+  stdout.writeLine(encodeJsonUtf8(node))
   stdout.flushFile()
 
 proc rpcOk(reqId: JsonNode, command: string, data: JsonNode = nil): JsonNode =
@@ -93,6 +93,26 @@ proc buildRpcStateJson(rt: AgentRuntime, isStreaming = false, isCompacting = fal
   if rt.session.displayName.len > 0:
     result["sessionName"] = %rt.session.displayName
 
+proc buildContextUsageJson(rt: AgentRuntime, messages: openArray[AgentMessage]): JsonNode =
+  let window = rt.currentModel.contextWindow
+  if window <= 0:
+    return nil
+
+  let branch = rt.session.activeBranchEntries()
+  for i in countdown(branch.high, 0):
+    let entry = branch[i]
+    if entry.kind == sekCompaction:
+      return %*{"tokens": newJNull(), "contextWindow": window, "percent": newJNull()}
+    if entry.kind == sekMessage and entry.message.role == mrAssistant and
+        entry.message.stopReason notin {srError, srAborted}:
+      let usage = entry.message.usage
+      if max(usage.totalTokens, usage.inputTokens + usage.outputTokens +
+          usage.cacheReadTokens + usage.cacheWriteTokens) > 0:
+        break
+
+  let tokens = if messages.len == 0: 0 else: estimateContextTokens(rt.runtimeSystemPrompt(), messages)
+  %*{"tokens": tokens, "contextWindow": window, "percent": tokens.float * 100 / window.float}
+
 proc readPrompt(payload: JsonNode): QueuedPrompt =
   result.text = payload{"message"}.getStr("")
   let images = payload{"images"}
@@ -111,7 +131,10 @@ proc runRpcMode*(rt: AgentRuntime): int =
   var inputClosed = false
   var deferred = initDeque[RpcCommand]()
   var currentAbort: AbortFlag = nil
+  var bashAbort: AbortFlag = nil
+  var compacting = false
   var abortRequests: seq[JsonNode] = @[]
+  let emitAgentEventJson = makeJsonEventPrinter()
 
   proc decodeCommand(message: RpcInput): Option[RpcCommand] =
     if message.kind == rikEof:
@@ -140,7 +163,8 @@ proc runRpcMode*(rt: AgentRuntime): int =
     let active = not currentAbort.isNil
     case cmd.kind
     of "get_state":
-      writeRpcLine(rpcOk(cmd.id, cmd.kind, buildRpcStateJson(rt, isStreaming = active)))
+      writeRpcLine(rpcOk(cmd.id, cmd.kind, buildRpcStateJson(rt, isStreaming = active and not compacting,
+        isCompacting = compacting)))
     of "prompt", "steer", "follow_up":
       if cmd.kind == "prompt" and not active:
         return false
@@ -160,6 +184,7 @@ proc runRpcMode*(rt: AgentRuntime): int =
           else:
             rt.followUpQueue.add(prompt)
           writeRpcLine(rpcOk(cmd.id, cmd.kind, %*{ "disposition": "queued" }))
+          rt.emitQueueUpdate(emitAgentEventJson)
     of "clear_queue":
       var steering = newJArray()
       for prompt in rt.steeringQueue: steering.add(%prompt.text)
@@ -168,12 +193,21 @@ proc runRpcMode*(rt: AgentRuntime): int =
       rt.steeringQueue.setLen(0)
       rt.followUpQueue.setLen(0)
       writeRpcLine(rpcOk(cmd.id, cmd.kind, %*{ "steering": steering, "followUp": followUp }))
+      rt.emitQueueUpdate(emitAgentEventJson)
     of "abort":
       if active:
         currentAbort.aborted = true
         abortRequests.add(cmd.id)
       else:
         writeRpcLine(rpcOk(cmd.id, cmd.kind))
+    of "abort_retry":
+      if active and currentAbort.retrying:
+        currentAbort.aborted = true
+      writeRpcLine(rpcOk(cmd.id, cmd.kind))
+    of "abort_bash":
+      if not bashAbort.isNil:
+        bashAbort.aborted = true
+      writeRpcLine(rpcOk(cmd.id, cmd.kind))
     of "set_steering_mode", "set_follow_up_mode":
       let mode = cmd.payload{"mode"}.getStr("")
       if mode notin [$qmOneAtATime, $qmAll]:
@@ -258,6 +292,8 @@ proc runRpcMode*(rt: AgentRuntime): int =
       writeRpcLine(rpcOk(reqId, cmdType, %*{ "disposition": "started" }))
       discard rt.runPrompt(prompt.text, abort = currentAbort, extraImages = prompt.images,
         onEvent = proc(ev: AgentEvent) =
+          if ev.kind == aekCompactionStart: compacting = true
+          elif ev.kind == aekCompaction: compacting = false
           emitAgentEventJson(ev)
           if ev.kind notin {aekToolStart, aekRunEnd}:
             drainActiveInput()
@@ -269,19 +305,43 @@ proc runRpcMode*(rt: AgentRuntime): int =
     of "set_model":
       let prov = cmdNode{"provider"}.getStr("")
       let mid = cmdNode{"modelId"}.getStr("")
-      if mid.len == 0 and prov.len == 0:
-        writeRpcLine(rpcErr(reqId, "set_model", "Missing `modelId` or `provider`"))
+      var model: Option[ModelConfig]
+      for providerId, providerConfig in rt.providerRegistry.providers.pairs:
+        if prov.len > 0 and providerId != prov: continue
+        for candidate in providerConfig.models:
+          if candidate.id == mid or providerId & "/" & candidate.id == mid or (mid.len == 0 and prov.len > 0):
+            model = some(candidate)
+            break
+        if model.isSome: break
+      if model.isNone:
+        writeRpcLine(rpcErr(reqId, "set_model", "Unknown model " & prov & "/" & mid))
       else:
-        let (m, _) = rt.providerRegistry.resolveModel(rt.cfg, mid, prov, rt.cliApiKey)
-        rt.switchModel(m)
-        writeRpcLine(rpcOk(reqId, "set_model", modelToRpcJson(m)))
+        rt.switchModel(model.get)
+        let level = clampThinkingLevel(model.get, rt.thinkingLevel)
+        if level != rt.thinkingLevel: rt.switchThinkingLevel(level)
+        writeRpcLine(rpcOk(reqId, "set_model", modelToRpcJson(model.get)))
 
     of "get_available_models":
       var arr = newJArray()
-      for _, prov in rt.providerRegistry.providers.pairs:
-        for m in prov.models:
-          arr.add(modelToRpcJson(m))
+      for item in rt.providerRegistry.listSelectableModels(rt.cfg, rt.cliApiKey):
+        if item.configured: arr.add(modelToRpcJson(item.model))
       writeRpcLine(rpcOk(reqId, "get_available_models", %*{ "models": arr }))
+
+    of "cycle_model":
+      let models = rt.providerRegistry.listSelectableModels(rt.cfg, rt.cliApiKey)
+      if models.len <= 1:
+        writeRpcLine(rpcOk(reqId, cmdType, newJNull()))
+      else:
+        var current = -1
+        for index, item in models:
+          if item.model.id == rt.currentModel.id and item.model.provider == rt.currentModel.provider:
+            current = index
+            break
+        let model = models[(current + 1) mod models.len].model
+        rt.switchModel(model)
+        let level = clampThinkingLevel(model, rt.thinkingLevel)
+        if level != rt.thinkingLevel: rt.switchThinkingLevel(level)
+        writeRpcLine(rpcOk(reqId, cmdType, %*{"model": modelToRpcJson(model), "thinkingLevel": $level, "isScoped": false}))
 
     of "set_thinking_level":
       let lv = parseThinkingLevel(cmdNode{"level"}.getStr("medium"), rt.thinkingLevel)
@@ -306,9 +366,24 @@ proc runRpcMode*(rt: AgentRuntime): int =
 
     of "compact":
       let beforeMsgs = rt.session.activeBranchEntries().len
-      let summaryOpt = rt.compactSession(force = true)
+      currentAbort = newAbortFlag()
+      currentAbort.onIdle = drainActiveInput
+      compacting = true
+      let instructions = cmdNode{"customInstructions"}.getStr("")
+      var compactionResult = newJNull()
+      let summaryOpt = rt.compactSession(force = true, onEvent = proc(ev: AgentEvent) =
+        if ev.kind == aekCompaction and ev.summaryText.len > 0:
+          compactionResult = %*{"summary": ev.summaryText, "firstKeptEntryId": ev.firstKeptId,
+            "tokensBefore": ev.tokensBefore, "estimatedTokensAfter": ev.estimatedTokensAfter,
+            "usage": ev.compactionUsage.toJson(), "entriesBefore": beforeMsgs}
+        emitAgentEventJson(ev), abort = currentAbort,
+        customInstructions = instructions)
+      for id in abortRequests: writeRpcLine(rpcOk(id, "abort"))
+      abortRequests.setLen(0)
+      currentAbort = nil
+      compacting = false
       if summaryOpt.isSome:
-        writeRpcLine(rpcOk(reqId, "compact", %*{ "summary": summaryOpt.get, "entriesBefore": beforeMsgs }))
+        writeRpcLine(rpcOk(reqId, "compact", compactionResult))
       else:
         writeRpcLine(rpcErr(reqId, "compact", "Conversation is too short or compaction failed"))
 
@@ -320,48 +395,80 @@ proc runRpcMode*(rt: AgentRuntime): int =
       rt.cfg.settings.retry.enabled = cmdNode{"enabled"}.getBool(true)
       writeRpcLine(rpcOk(reqId, "set_auto_retry"))
 
-    of "abort_retry":
-      writeRpcLine(rpcOk(reqId, "abort_retry"))
-
     of "bash":
       let cmdStr = cmdNode{"command"}.getStr("")
       let excludeCtx = cmdNode{"excludeFromContext"}.getBool(false)
       if cmdStr.strip().len == 0:
         writeRpcLine(rpcErr(reqId, "bash", "Missing `command`"))
       else:
-        let (exe, baseArgs) = resolveBashShell(rt.cfg.settings.shellPath)
-        let res = runProcessCapture(exe, baseArgs & @[cmdStr], rt.cfg.cwd, nil, 0.0, nil)
-        if not excludeCtx:
+        bashAbort = newAbortFlag()
+        bashAbort.onIdle = drainActiveInput
+        defer: bashAbort = nil
+        try:
+          let res = runUserShell(cmdStr, rt.cfg.cwd, rt.cfg.settings, rt.security, bashAbort,
+            onOutput = proc(delta: string) =
+              let update = %*{"type": "bash_execution_update", "delta": delta}
+              if not reqId.isNil and reqId.kind != JNull:
+                update["id"] = reqId
+              writeRpcLine(update))
           let trunc = truncateHead(res.output.replace("\r\n", "\n"))
-          discard rt.session.appendMessage(newUserMessage(
-            "<user_shell command=\"" & cmdStr & "\" exit_code=\"" & $res.exitCode & "\">\n" & trunc.content & "\n</user_shell>"
-          ))
-        writeRpcLine(rpcOk(reqId, "bash", %*{
-          "output": res.output,
-          "exitCode": res.exitCode,
-          "cancelled": res.aborted,
-          "truncated": false
-        }))
+          if not excludeCtx:
+            discard rt.session.appendMessage(newUserMessage(
+              "<user_shell command=\"" & cmdStr & "\" exit_code=\"" & $res.exitCode & "\">\n" & trunc.content & "\n</user_shell>"
+            ))
+          let data = %*{"output": trunc.content, "exitCode": (if res.aborted: newJNull() else: %res.exitCode),
+            "cancelled": res.aborted, "truncated": trunc.truncated}
+          if trunc.truncated:
+            let path = saveFullOutputTemp("bash", res.output)
+            if path.len > 0: data["fullOutputPath"] = %path
+            else: data["fullOutputError"] = %"Unable to save the full Bash output"
+          writeRpcLine(rpcOk(reqId, "bash", data))
+        except CatchableError as e:
+          writeRpcLine(rpcErr(reqId, "bash", e.msg))
 
     of "new_session":
       let parentSess = cmdNode{"parentSession"}.getStr("")
-      let sessionsRoot = resolveSessionsRoot(rt.cfg)
-      rt.session = newSessionManager(rt.cfg.cwd, sessionsRoot, persist = rt.session.persist, parentSessionPath = parentSess)
+      let sessionsRoot = rt.sessionsRoot
+      rt.switchSession(newSessionManager(rt.cfg.cwd, sessionsRoot, persist = rt.session.persist, parentSessionPath = parentSess))
       writeRpcLine(rpcOk(reqId, "new_session", %*{ "cancelled": false, "sessionId": rt.session.id }))
 
     of "switch_session":
       let spath = cmdNode{"sessionPath"}.getStr("")
-      let found = findSessionByIdOrPath(resolveSessionsRoot(rt.cfg), rt.cfg.cwd, spath)
+      let found = findSessionByIdOrPath(rt.sessionsRoot, rt.cfg.cwd, spath)
       if found.isNone:
         writeRpcLine(rpcErr(reqId, "switch_session", "Session not found: " & spath))
       else:
-        rt.session = loadSessionFile(found.get, persist = rt.session.persist)
-        writeRpcLine(rpcOk(reqId, "switch_session", %*{ "cancelled": false }))
+        try:
+          rt.switchSession(rt.session.reopenSession(found.get))
+          for diagnostic in rt.session.diagnostics:
+            stderr.writeLine("Warning: " & diagnostic)
+          writeRpcLine(rpcOk(reqId, "switch_session", %*{ "cancelled": false }))
+        except IOError, OSError:
+          writeRpcLine(rpcErr(reqId, cmdType, getCurrentExceptionMsg()))
 
-    of "fork", "clone":
+    of "fork":
       let entryId = cmdNode{"entryId"}.getStr("")
-      rt.session = rt.session.forkSessionAtEntry(entryId, resolveSessionsRoot(rt.cfg))
-      writeRpcLine(rpcOk(reqId, cmdType, %*{ "text": "", "cancelled": false, "sessionId": rt.session.id }))
+      var selected: Option[SessionEntry]
+      for entry in rt.session.activeBranchEntries():
+        if entry.id == entryId and entry.kind == sekMessage and entry.message.role == mrUser:
+          selected = some(entry)
+          break
+      if selected.isNone:
+        writeRpcLine(rpcErr(reqId, cmdType, "Select a user message on the active branch to fork"))
+      else:
+        let text = collectText(selected.get.message.userBlocks)
+        try:
+          rt.switchSession(rt.session.forkSessionAtEntry(entryId, rt.sessionsRoot, before = true))
+          writeRpcLine(rpcOk(reqId, cmdType, %*{"text": text, "cancelled": false, "sessionId": rt.session.id}))
+        except IOError, OSError:
+          writeRpcLine(rpcErr(reqId, cmdType, getCurrentExceptionMsg()))
+
+    of "clone":
+      try:
+        rt.switchSession(rt.session.forkSessionAtEntry("", rt.sessionsRoot))
+        writeRpcLine(rpcOk(reqId, cmdType, %*{"cancelled": false, "sessionId": rt.session.id}))
+      except IOError, OSError:
+        writeRpcLine(rpcErr(reqId, cmdType, getCurrentExceptionMsg()))
 
     of "get_fork_messages":
       let messages = newJArray()
@@ -401,6 +508,7 @@ proc runRpcMode*(rt: AgentRuntime): int =
     of "get_messages":
       let (msgs, _, _) = rt.session.buildActiveContext()
       var mArr = newJArray()
+      mArr.add(AgentMessage(role: mrSystem, systemContent: rt.runtimeSystemPrompt()).toJson())
       for m in msgs:
         mArr.add(m.toJson())
       writeRpcLine(rpcOk(reqId, "get_messages", %*{ "messages": mArr }))
@@ -417,11 +525,28 @@ proc runRpcMode*(rt: AgentRuntime): int =
     of "get_session_stats":
       let (msgs, _, _) = rt.session.buildActiveContext()
       let u = rt.session.totalUsage
-      writeRpcLine(rpcOk(reqId, "get_session_stats", %*{
+      var userMessages, assistantMessages, toolCalls, toolResults, totalMessages: int
+      for entry in rt.session.entries:
+        if entry.kind != sekMessage:
+          continue
+        inc totalMessages
+        case entry.message.role
+        of mrUser: inc userMessages
+        of mrAssistant:
+          inc assistantMessages
+          toolCalls += collectToolCalls(entry.message.assistantBlocks).len
+        of mrToolResult: inc toolResults
+        of mrSystem: discard
+      let data = %*{
         "sessionId": rt.session.id,
         "sessionFile": rt.session.filePath,
         "entryCount": rt.session.entries.len,
         "messageCount": msgs.len,
+        "userMessages": userMessages,
+        "assistantMessages": assistantMessages,
+        "toolCalls": toolCalls,
+        "toolResults": toolResults,
+        "totalMessages": totalMessages,
         "tokens": {
           "input": u.inputTokens,
           "output": u.outputTokens,
@@ -430,7 +555,11 @@ proc runRpcMode*(rt: AgentRuntime): int =
           "total": u.totalTokens
         },
         "cost": u.costTotal
-      }))
+      }
+      let contextUsage = rt.buildContextUsageJson(msgs)
+      if not contextUsage.isNil:
+        data["contextUsage"] = contextUsage
+      writeRpcLine(rpcOk(reqId, "get_session_stats", data))
 
     of "export_html":
       let outPath = cmdNode{"outputPath"}.getStr("")

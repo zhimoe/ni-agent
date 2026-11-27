@@ -18,6 +18,7 @@ type
     srToolUse = "toolUse"
     srError = "error"
     srAborted = "aborted"
+    srTurnLimit = "turnLimit"
 
   ContentKind* = enum
     ckText
@@ -136,6 +137,8 @@ type
 
   AbortFlag* = ref object
     aborted*: bool
+    retrying*: bool
+    onIdle*: proc() {.closure.}
 
   StreamEventKind* = enum
     sekStart
@@ -146,6 +149,8 @@ type
     sekToolCallEnd
     sekDone
     sekError
+    sekRetryStart
+    sekRetryEnd
 
   StreamEvent* = object
     case kind*: StreamEventKind
@@ -170,6 +175,11 @@ type
       usage*: Usage
     of sekError:
       errorMsg*: string
+    of sekRetryStart, sekRetryEnd:
+      retryAttempt*: int
+      retryLimit*: int
+      retryDelayMs*: int
+      retryError*: string
 
   StreamCallback* = proc(ev: StreamEvent) {.closure.}
 
@@ -187,6 +197,13 @@ proc nowIsoUtc*(): string =
 proc newAbortFlag*(): AbortFlag =
   ## Allocate a fresh cancellation flag shared across one agent turn.
   AbortFlag(aborted: false)
+
+proc pollAbort*(abort: AbortFlag): bool =
+  if abort.isNil:
+    return false
+  if not abort.aborted and not abort.onIdle.isNil:
+    abort.onIdle()
+  abort.aborted
 
 # ContentBlock constructors
 
@@ -461,6 +478,7 @@ proc parseAgentMessage*(node: JsonNode): Option[AgentMessage] =
       of "toolUse": srToolUse
       of "error": srError
       of "aborted": srAborted
+      of "turnLimit": srTurnLimit
       else: srStop
     some(AgentMessage(
       role: mrAssistant,

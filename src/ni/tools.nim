@@ -21,6 +21,7 @@ type
     abort*: AbortFlag
     sessionId*: string
     modelId*: string
+    onOutput*: proc(delta: string) {.closure.}
 
   ToolExecuteProc* = proc(args: JsonNode, ctx: ToolContext): ToolOutput {.closure.}
 
@@ -37,6 +38,7 @@ type
   ToolRegistry* = ref object
     tools*: OrderedTable[string, AgentTool]
     activeNames*: HashSet[string]
+    discoverableNames*: HashSet[string]
 
   EditBlock = object
     oldText: string
@@ -125,7 +127,8 @@ proc runProcessCapture*(
   env: StringTableRef,
   timeoutSec: float,
   abort: AbortFlag,
-  stdinPayload = ""
+  stdinPayload = "",
+  onOutput: proc(delta: string) {.closure.} = nil
 ): tuple[output: string, exitCode: int, timedOut: bool, aborted: bool, wallSec: float] =
   ## Spawn a process without shell injection, stream combined stdout+stderr with deadline & abort support.
   let startMono = getMonoTime()
@@ -133,7 +136,7 @@ proc runProcessCapture*(
     when defined(windows):
       {poUsePath, poStdErrToStdOut, poInteractive, poDaemon}
     else:
-      {poUsePath, poStdErrToStdOut}
+      {poUsePath, poStdErrToStdOut, poDaemon}
 
   let p = startProcess(exe, workingDir = cwd, args = args, env = env, options = opts)
   defer:
@@ -152,13 +155,22 @@ proc runProcessCapture*(
 
   let outFd = p.outputHandle()
   var output = newStringOfCap(4096)
+  var pending = ""
+  proc addOutput(chunk: string) =
+    output.add(chunk)
+    if not onOutput.isNil:
+      pending.add(chunk)
+      let endAt = completeUtf8Prefix(pending)
+      if endAt > 0:
+        onOutput(pending[0 ..< endAt])
+        pending = pending[endAt .. ^1]
   var eof = false
   var timedOut = false
   var wasAborted = false
   let hasDeadline = timeoutSec > 0.0
 
   while not eof:
-    if not abort.isNil and abort.aborted:
+    if abort.pollAbort():
       wasAborted = true
       killProcessTree(p)
       break
@@ -171,14 +183,14 @@ proc runProcessCapture*(
 
     let (chunk, hitEof) = readAvailableFd(outFd)
     if chunk.len > 0:
-      output.add(chunk)
+      addOutput(chunk)
     elif hitEof:
       eof = true
     elif not p.running():
       # Drain any final bytes queued right as the process exited
       let (tailChunk, _) = readAvailableFd(outFd)
       if tailChunk.len > 0:
-        output.add(tailChunk)
+        addOutput(tailChunk)
       else:
         eof = true
     else:
@@ -196,6 +208,8 @@ proc runProcessCapture*(
     code = p.waitForExit()
   else:
     discard p.peekExitCode()
+  if pending.len > 0:
+    onOutput(pending)
 
   let wall = (getMonoTime() - startMono).inMilliseconds.float / 1000.0
   (output, code, timedOut, wasAborted, wall)
@@ -327,6 +341,9 @@ proc execReadTool(args: JsonNode, ctx: ToolContext): ToolOutput =
   if rawPath.len == 0:
     return errorOutput("Missing required parameter: path")
   let fullPath = resolvePathFrom(rawPath, ctx.cwd)
+  let deny = ctx.security.checkFileRead(fullPath)
+  if deny.len > 0:
+    return errorOutput(deny)
   if not fileExists(fullPath):
     return errorOutput("File not found: " & rawPath)
 
@@ -653,9 +670,7 @@ proc resolvePowerShellExe*(): tuple[exe: string, baseArgs: seq[string]] =
   return ("", @[])
 
 proc buildChildEnv(ctx: ToolContext): StringTableRef =
-  result = newStringTable(modeCaseSensitive)
-  for k, v in envPairs():
-    result[k] = v
+  result = ctx.security.processEnvironment()
   result["NI_CWD"] = ctx.cwd
   result["PI_CWD"] = ctx.cwd
   if ctx.modelId.len > 0:
@@ -688,18 +703,13 @@ proc execShellCommon(shellKind: string, exe: string, baseArgs: seq[string], args
   else:
     rawCmd
 
-  var spawnExe = exe
-  var spawnArgs = baseArgs & @[fullCmd]
-  if not ctx.security.isNil and not ctx.security.sandboxWrap.isNil:
-    let wrapped = ctx.security.sandboxWrap(spawnExe, spawnArgs, ctx.cwd)
-    spawnExe = wrapped.exe
-    spawnArgs = wrapped.args
-
   if not dirExists(ctx.cwd):
     return errorOutput("Working directory does not exist: " & ctx.cwd)
 
   try:
-    let res = runProcessCapture(spawnExe, spawnArgs, ctx.cwd, buildChildEnv(ctx), timeoutSec, ctx.abort)
+    let (spawnExe, spawnArgs) = ctx.security.wrapProcess(exe, baseArgs & @[fullCmd], ctx.cwd)
+    let res = runProcessCapture(spawnExe, spawnArgs, ctx.cwd, buildChildEnv(ctx), timeoutSec, ctx.abort,
+      onOutput = ctx.onOutput)
     if res.aborted:
       return errorOutput("Command aborted by user")
     if res.timedOut:
@@ -736,12 +746,25 @@ proc execPowerShellTool(args: JsonNode, ctx: ToolContext): ToolOutput =
   let (exe, baseArgs) = resolvePowerShellExe()
   execShellCommon("powershell", exe, baseArgs, args, ctx)
 
+proc runUserShell*(command, cwd: string, settings: NiSettings, policy: SecurityPolicy,
+                   abort: AbortFlag, timeoutSec = 0.0,
+                   onOutput: proc(delta: string) {.closure.} = nil):
+    tuple[output: string, exitCode: int, timedOut: bool, aborted: bool, wallSec: float] =
+  let (exe, args) = resolveBashShell(settings.shellPath)
+  if exe.len == 0:
+    raise newException(IOError, "bash executable was not found on this system")
+  let (wrappedExe, wrappedArgs) = policy.wrapProcess(exe, args & @[command], cwd)
+  runProcessCapture(wrappedExe, wrappedArgs, cwd, policy.processEnvironment(), timeoutSec, abort, onOutput = onOutput)
+
 # 5. `ls` tool
 
 proc execLsTool(args: JsonNode, ctx: ToolContext): ToolOutput =
   let rel = args{"path"}.getStr(".")
   let limit = max(1, args{"limit"}.getInt(500))
   let dirPath = resolvePathFrom(rel, ctx.cwd)
+  let deny = ctx.security.checkFileRead(dirPath)
+  if deny.len > 0:
+    return errorOutput(deny)
   if not dirExists(dirPath):
     if fileExists(dirPath):
       return errorOutput("Not a directory: " & rel)
@@ -775,16 +798,18 @@ proc execLsTool(args: JsonNode, ctx: ToolContext): ToolOutput =
 proc shouldSkipWalkDir(name: string): bool =
   name in [".git", "node_modules", ".hg", ".svn", "nimcache"]
 
-proc walkProjectFilesPureNim(searchRoot, pattern: string, maxResults: int, abort: AbortFlag): seq[string] =
+proc walkProjectFilesPureNim(searchRoot, pattern: string, maxResults: int, ctx: ToolContext): seq[string] =
   var stack: seq[string] = @[searchRoot]
   while stack.len > 0 and result.len < maxResults:
-    if not abort.isNil and abort.aborted:
+    if ctx.abort.pollAbort():
       break
     let cur = stack.pop()
     var subDirs: seq[string] = @[]
     var files: seq[string] = @[]
     try:
       for kind, p in walkDir(cur):
+        if ctx.security.checkFileRead(p).len > 0:
+          continue
         let name = extractFilename(p)
         if kind in {pcDir, pcLinkToDir}:
           if not shouldSkipWalkDir(name):
@@ -812,10 +837,13 @@ proc execFindTool(args: JsonNode, ctx: ToolContext): ToolOutput =
   let relDir = args{"path"}.getStr(".")
   let limit = max(1, args{"limit"}.getInt(1000))
   let searchRoot = resolvePathFrom(relDir, ctx.cwd)
+  let deny = ctx.security.checkFileRead(searchRoot)
+  if deny.len > 0:
+    return errorOutput(deny)
   if not dirExists(searchRoot) and not fileExists(searchRoot):
     return errorOutput("Path not found: " & relDir)
 
-  let matches = walkProjectFilesPureNim(searchRoot, pattern, limit + 1, ctx.abort)
+  let matches = walkProjectFilesPureNim(searchRoot, pattern, limit + 1, ctx)
   if not ctx.abort.isNil and ctx.abort.aborted:
     return errorOutput("Operation aborted")
   if matches.len == 0:
@@ -840,13 +868,13 @@ proc clipGrepLine(s: string): string =
 proc execGrepPureNim(
   pattern, searchPath, globPat: string,
   ignoreCase, contextCount, limit: int,
-  abort: AbortFlag
+  ctx: ToolContext
 ): ToolOutput =
   let needle = if ignoreCase != 0: pattern.toLowerAscii() else: pattern
   let files = if fileExists(searchPath):
     @[searchPath]
   else:
-    var rels = walkProjectFilesPureNim(searchPath, if globPat.len > 0: globPat else: "*", 10_000, abort)
+    let rels = walkProjectFilesPureNim(searchPath, if globPat.len > 0: globPat else: "*", 10_000, ctx)
     var fulls: seq[string] = @[]
     for r in rels:
       fulls.add(searchPath / r)
@@ -857,7 +885,7 @@ proc execGrepPureNim(
   var hitLimit = false
 
   for fp in files:
-    if not abort.isNil and abort.aborted:
+    if ctx.abort.pollAbort():
       return errorOutput("Operation aborted")
     var raw = ""
     try:
@@ -905,12 +933,15 @@ proc execGrepTool(args: JsonNode, ctx: ToolContext): ToolOutput =
   let limit = max(1, args{"limit"}.getInt(100))
 
   let searchPath = resolvePathFrom(relDir, ctx.cwd)
+  let deny = ctx.security.checkFileRead(searchPath)
+  if deny.len > 0:
+    return errorOutput(deny)
   if not dirExists(searchPath) and not fileExists(searchPath):
     return errorOutput("Path not found: " & relDir)
 
   let rgExe = findExe("rg")
   if rgExe.len == 0:
-    return execGrepPureNim(pattern, searchPath, globPat, (if ignoreCase: 1 else: 0), ctxLines, limit, ctx.abort)
+    return execGrepPureNim(pattern, searchPath, globPat, (if ignoreCase: 1 else: 0), ctxLines, limit, ctx)
 
   let isDir = dirExists(searchPath)
   var rgArgs = @["--no-config", "--line-number", "--color=never", "--hidden"]
@@ -926,7 +957,8 @@ proc execGrepTool(args: JsonNode, ctx: ToolContext): ToolOutput =
   rgArgs.add(["--", pattern, (if isDir: "." else: searchPath)])
 
   let runDir = if isDir: searchPath else: parentDir(searchPath)
-  let res = runProcessCapture(rgExe, rgArgs, runDir, buildChildEnv(ctx), 30.0, ctx.abort)
+  let (spawnExe, spawnArgs) = ctx.security.wrapProcess(rgExe, rgArgs, runDir)
+  let res = runProcessCapture(spawnExe, spawnArgs, runDir, buildChildEnv(ctx), 30.0, ctx.abort)
   if res.aborted:
     return errorOutput("Operation aborted")
   if res.exitCode == 1 and res.output.strip().len == 0:
@@ -1073,7 +1105,7 @@ proc makeToolSearchTool*(reg: ToolRegistry): AgentTool =
 
       var scored: seq[tuple[score: float, tool: AgentTool]] = @[]
       for tname, tool in reg.tools.pairs:
-        if tool.exposure == teHidden or tname == "tool_search":
+        if tname notin reg.discoverableNames or tool.exposure == teHidden:
           continue
         if nsFilter.len > 0:
           let normNs = tool.namespace.toLowerAscii().replace("-", "_")
@@ -1321,15 +1353,27 @@ proc newToolRegistry*(enabledList: openArray[string], includePowerShell = define
   ## Create a ToolRegistry and activate the requested startup tool names.
   result = ToolRegistry(
     tools: initOrderedTable[string, AgentTool](),
-    activeNames: initHashSet[string]()
+    activeNames: initHashSet[string](),
+    discoverableNames: initHashSet[string]()
   )
   result.registerBuiltInTools(includePowerShell)
   for name in enabledList:
     if result.tools.hasKey(name):
       result.activeNames.incl(name)
-  # Always keep ask_question available when default built-ins are active unless explicitly removed
-  if "read" in result.activeNames and "ask_question" in result.tools and "ask_question" in enabledList:
-    result.activeNames.incl("ask_question")
+
+proc applyToolOverrides*(reg: ToolRegistry, entries: openArray[string]) =
+  ## Apply both execution and discovery restrictions to a loadout.
+  var active, discoverable: seq[string]
+  for name in reg.activeNames: active.add(name)
+  for name in reg.discoverableNames: discoverable.add(name)
+  reg.activeNames.clear()
+  reg.discoverableNames.clear()
+  for name in applyToolListSpec(active, entries):
+    if reg.tools.hasKey(name) and reg.tools[name].exposure != teHidden:
+      reg.activeNames.incl(name)
+  for name in applyToolListSpec(discoverable, entries):
+    if reg.tools.hasKey(name) and reg.tools[name].exposure in {teDeferred, teCodemode}:
+      reg.discoverableNames.incl(name)
 
 proc declaredToolSchemas*(reg: ToolRegistry): seq[ToolSchemaDef] =
   ## Build the list of tool JSON schemas exposed directly to the LLM on the next turn.
@@ -1348,6 +1392,8 @@ proc invokeTool*(reg: ToolRegistry, name: string, args: JsonNode, ctx: ToolConte
   let tool = reg.tools[name]
   if tool.exposure == teHidden:
     return errorOutput("Tool '" & name & "' is hidden by configuration.")
+  if name notin reg.activeNames:
+    return errorOutput("Tool '" & name & "' is not enabled.")
   try:
     return tool.execute(if args.isNil: newJObject() else: args, ctx)
   except CatchableError as e:

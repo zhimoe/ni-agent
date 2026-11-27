@@ -974,19 +974,12 @@ proc formatCompactCount*(n: int): string =
   else:
     formatFloat(n.float / 1_000_000.0, ffDecimal, 1) & "M"
 
-proc renderTopBorderWithStatus(cols: int, workingStatus: string): string =
-  if workingStatus.len == 0:
-    return styleDim("─".repeat(cols))
-  let clipped = truncateVisible(workingStatus, max(8, cols - 6))
-  let used = visibleWidth(clipped)
-  let tailDashes = max(1, cols - 4 - used)
-  styleDim("── ") & clipped & styleDim(" " & "─".repeat(tailDashes))
-
 proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int, maxRows = high(int)): seq[string] =
-  ## Render the Pi/Codex-style docked input box: queued messages, status-embedded top border, multi-line input, bottom border, two-column footer, and autocomplete popup.
+  ## Render the dock with working status above the input and usage in the footer.
   let cols = clamp(termCols, 20, 300)
   # Reserve the two borders, footer, and one visible input row before showing queues or suggestions.
-  let spareRows = max(4, maxRows) - 4
+  let showWorking = status.workingStatus.len > 0 and maxRows >= 5
+  let spareRows = max(4, maxRows) - 4 - int(showWorking)
   let queueRows = min(status.queuedMessages.len, spareRows div 3)
   let totalSuggestions = if ed.acKind != ackNone: ed.acItems.len else: 0
   let menuRows = min(totalSuggestions, min(AutocompleteMaxVisible + 1, (spareRows - queueRows + 1) div 2))
@@ -1027,7 +1020,10 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
       let hint = "    (" & $(ed.acIndex + 1) & "/" & $totalSuggestions & " — ↑/↓ select, Tab complete, Esc close)"
       result.add(styleDim(truncateVisible(hint, cols)))
 
-  result.add(renderTopBorderWithStatus(cols, status.workingStatus))
+  if showWorking:
+    result.add(truncateVisible("  " & status.workingStatus, cols))
+  let border = styleDim("─".repeat(cols))
+  result.add(border)
 
   let prefixFirst = styleBold(styleCyan("❯ "))
   let prefixCont = styleDim("· ")
@@ -1036,7 +1032,7 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
   let isEmpty = ed.lines.len == 1 and ed.lines[0].len == 0
   if isEmpty:
     let hintStr = if status.workingStatus.len > 0:
-      "Type a message to queue · Esc to interrupt"
+      "Type a message…"
     else:
       "Ask anything · /commands · @file · !shell · Ctrl+J newline"
     let placeholder = styleDim(hintStr)
@@ -1059,11 +1055,11 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
     let firstRow = max(0, cursorRow - inputRows + 1)
     result.add(wrappedInput[firstRow ..< min(wrappedInput.len, firstRow + inputRows)])
 
-  result.add(styleDim("─".repeat(cols)))
+  result.add(border)
 
   # Two-column justified footer matching Pi's FooterComponent:
   # Left:  🌿 ni · ~/workspace (branch) [• sessionName]
-  # Right: ↑in ↓out [Rcache] [$cost] [ctx%/win] · model:thinking
+  # Right: total tok ↑in ↓out [Rcache] [$cost] [ctx%/win] · model:thinking
   var leftRest = ""
   if status.cwd.len > 0:
     leftRest.add(" · " & shortenPathForStatus(status.cwd, max(16, cols div 3)))
@@ -1073,6 +1069,8 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
       leftRest.add(" • " & truncateVisible(status.sessionName, 18))
 
   var statsParts: seq[string] = @[]
+  if status.totalTokens > 0:
+    statsParts.add(formatCompactCount(status.totalTokens) & " tok")
   if status.inputTokens > 0:
     statsParts.add("↑" & formatCompactCount(status.inputTokens))
   if status.outputTokens > 0:
@@ -1124,8 +1122,10 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
       result.add(lTrunc & spaces(pad) & rightStyled)
     else:
       result.add(truncateVisible(rightStyled, cols))
+  elif rightW > cols:
+    result.add(truncateVisible(rightStyled, cols))
   else:
-    result.add(truncateVisible(leftStyled & "  " & rightStyled, cols))
+    result.add(truncateVisible(leftStyled, cols))
 
 # Interactive prompt read loop
 

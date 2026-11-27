@@ -1,7 +1,7 @@
 # Unit tests for Pi configuration loading, value interpolation, project trust, and runtime security policy.
 
 import std/[options, os, tables, unittest]
-import ../src/ni/[types, config, trust]
+import ../src/ni/[types, config, trust, agent]
 
 proc makeTempTestDir(prefix: string): string =
   result = getTempDir() / ("ni_test_" & prefix & "_" & $nowUnixMs())
@@ -120,3 +120,37 @@ suite "Config, Auth, Models, and Trust Security":
     check policy.checkShellExecution("git reset --hard HEAD~1").len > 0
     check policy.checkShellExecution("rm -rf /").len > 0
     check policy.checkShellExecution("cat ~/.pi/agent/auth.json").len > 0
+
+  test "Runtime configuration reload keeps explicit prompt, security, and resource overrides":
+    let root = makeTempTestDir("reload")
+    defer: removeDir(root)
+    let agentDir = root / "agent"
+    let explicitSkill = root / "extra" / "SKILL.md"
+    let explicitTemplate = root / "explicit.md"
+    createDir(parentDir(explicitSkill))
+    createDir(agentDir / "skills" / "default")
+    createDir(agentDir / "prompts")
+    writeFile(explicitSkill, "---\nname: extra\ndescription: Explicit skill\n---\nExtra skill body\n")
+    writeFile(explicitTemplate, "Explicit template")
+    writeFile(agentDir / "skills" / "default" / "SKILL.md",
+      "---\nname: default\ndescription: Default skill\n---\nDefault skill body\n")
+    writeFile(agentDir / "prompts" / "default.md", "Default template")
+    let overrides = RuntimeConfigOverrides(noContextFiles: true, noSkills: true, noPromptTemplates: true,
+      systemPrompt: some("Explicit system prompt"), securityMode: some(smStrict),
+      extraSkills: @[explicitSkill], extraPromptTemplates: @[explicitTemplate])
+
+    let first = loadRuntimeConfig(root, agentDir, false, overrides)
+    check first.customSystemPrompt == "Explicit system prompt"
+    writeFile(root / "AGENTS.md", "Workspace instructions")
+    writeFile(agentDir / "SYSTEM.md", "System prompt from disk")
+    writeFile(agentDir / "settings.json", """{"securityMode":"permissive"}""")
+    let reloaded = loadRuntimeConfig(root, agentDir, true, overrides)
+    let (skills, templates, diagnostics) = discoverRuntimeResources(reloaded, overrides)
+    check reloaded.contextFiles.len == 0
+    check reloaded.customSystemPrompt == "Explicit system prompt"
+    check reloaded.settings.securityMode == smStrict
+    check diagnostics.len == 0
+    require skills.len == 1
+    require templates.len == 1
+    check skills[0].name == "extra"
+    check templates[0].name == "explicit"

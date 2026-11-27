@@ -1,9 +1,22 @@
 # CLI entry point for `ni` coding agent (`ni`, `ni mcp ...`, `ni auth ...`).
 
 import std/[json, options, os, strutils, tables, terminal]
-import ./ni/[types, config, trust, provider, tools, skills, mcp, session, agent, terminal_io, tui, rpc]
+import ./ni/[types, config, trust, provider, tools, mcp, session, agent, terminal_io, tui, rpc, sandbox, utf8, release_info]
 
-const NiVersion = "0.2.0"
+type CliArgumentError = object of ValueError
+
+proc optionValue(args: openArray[string], index: var int): string =
+  let flag = args[index]
+  if index + 1 >= args.len:
+    raise newException(CliArgumentError, "Missing value for " & flag)
+  let value = args[index + 1]
+  # Preserve values such as `--tools -bash` and free-form prompt text.
+  let optionLike = value in ["-a", "-na", "-h", "-v", "-p", "-m", "-c", "-r", "-n", "-t", "-nt",
+    "-ns", "-np", "-nc", "-l"] or (value.startsWith("--") and value.find(Whitespace) < 0)
+  if value.len == 0 or optionLike:
+    raise newException(CliArgumentError, "Missing value for " & flag)
+  inc index
+  value
 
 proc printCliHelp() =
   stdout.writeLine("""
@@ -25,7 +38,7 @@ Options:
   -c, --continue                   Continue most recent session for current directory
   -r, --resume                     Interactively pick a session to resume
       --session <id|path>          Open session by file path or ID prefix
-      --session-id <id>            Use or create specific session ID
+      --session-id <id>            Continue or create the session with this ID in the current workspace
       --fork <id|path>             Fork an existing session into a new session
       --session-dir <dir>          Override session storage root directory
       --no-session                 Run in-memory without writing session JSONL
@@ -43,6 +56,7 @@ Options:
   -a, --approve                    Trust project .pi / .agents configuration for this run
   -na, --no-approve                Ignore project .pi / .agents configuration for this run
       --security <mode>            Security policy: balanced (default), strict, permissive
+      --sandbox <mode>             Process sandbox: off (default), read-only, workspace-write
       --yolo                       Alias for --security permissive
       --agent-dir <dir>            Override ~/.pi/agent directory
   -v, --version                    Print version and exit
@@ -53,6 +67,10 @@ Subcommands:
   ni mcp add <name> [-l|--local] [--exposure <mode>] [--description <text>]
                     [--env KEY=VAL] [--header KEY=VAL] [--url <url>] [-- <cmd> <args...>]
   ni mcp remove <name> [-l|--local]
+  ni mcp login <name> [--no-browser]
+  ni mcp logout <name>
+  ni mcp enable|disable <name> [--tool <tool-name>]
+  ni mcp reconnect <name>
   ni auth login <provider> [--api-key <key>]
   ni auth logout <provider>
   ni auth check --provider <provider> [--json]
@@ -84,11 +102,11 @@ proc runAuthSubcommand(args: seq[string]): int =
     let a = args[i]
     case a
     of "--provider":
-      if i + 1 < args.len: providerId = args[i + 1]; inc i
+      providerId = optionValue(args, i)
     of "--api-key":
-      if i + 1 < args.len: explicitKey = args[i + 1]; inc i
+      explicitKey = optionValue(args, i)
     of "--agent-dir":
-      if i + 1 < args.len: agentDirOv = args[i + 1]; inc i
+      agentDirOv = optionValue(args, i)
     of "--json":
       asJson = true
     else:
@@ -131,7 +149,7 @@ proc runAuthSubcommand(args: seq[string]): int =
     let resolved = reg.resolveProviderApiKey(cfg, providerId)
     let status = if resolved.isSome: "ready" else: "not_ready"
     if asJson:
-      stdout.writeLine($(%*{ "provider": providerId, "status": status }))
+      stdout.writeLine(encodeJsonUtf8(%*{ "provider": providerId, "status": status }))
     else:
       stdout.writeLine(status)
     return (if resolved.isSome: 0 else: 1)
@@ -155,7 +173,7 @@ proc runMcpSubcommand(args: seq[string]): int =
     var i = 1
     while i < args.len:
       if args[i] == "--json": asJson = true
-      elif args[i] == "--agent-dir" and i + 1 < args.len: agentDirOv = args[i + 1]; inc i
+      elif args[i] == "--agent-dir": agentDirOv = optionValue(args, i)
       inc i
     let agentDir = getAgentDir(agentDirOv)
     let trusted = resolveProjectTrust(cwd, agentDir, ptmAsk)
@@ -180,9 +198,10 @@ proc runMcpSubcommand(args: seq[string]): int =
           "exposure": $sess.config.exposure,
           "source": sess.config.source,
           "tools": tArr,
-          "error": sess.lastError
+          "error": sess.lastError,
+          "errorKind": $sess.failureKind
         })
-      stdout.writeLine($(%*{ "servers": arr, "diagnostics": mgr.diagnostics }))
+      stdout.writeLine(encodeJsonUtf8(%*{ "servers": arr, "diagnostics": mgr.diagnostics }))
     else:
       if mgr.servers.len == 0:
         stdout.writeLine("No MCP servers configured.")
@@ -192,12 +211,64 @@ proc runMcpSubcommand(args: seq[string]): int =
         stdout.writeLine(name & " (" & $sess.config.transportKind & ", " & sess.config.source & "): " &
                          $sess.state & " — " & $sess.remoteTools.len & " tool(s), exposure=" & $sess.config.exposure)
         if sess.lastError.len > 0:
-          stdout.writeLine("  error: " & sess.lastError)
+          stdout.writeLine("  " & $sess.failureKind & ": " & sess.lastError)
         for rt in sess.remoteTools:
           stdout.writeLine("  - " & rt.qualifiedName & " [" & $rt.effectiveExposure & "]")
       for d in mgr.diagnostics:
         stderr.writeLine("warning: " & d)
     return (if hasFailure: 1 else: 0)
+
+  of "login", "logout", "enable", "disable", "reconnect":
+    if args.len < 2 or not isValidServerName(args[1]):
+      stderr.writeLine("Usage: ni mcp " & action & " <server-name>")
+      return 1
+    var agentDirOverride, tool: string
+    var noBrowser, approve = false
+    var i = 2
+    while i < args.len:
+      case args[i]
+      of "--agent-dir", "--tool":
+        let flag = args[i]
+        let value = optionValue(args, i)
+        if flag == "--agent-dir": agentDirOverride = value
+        else: tool = value
+      of "--no-browser": noBrowser = true
+      of "-a", "--approve": approve = true
+      else:
+        stderr.writeLine("Unknown MCP option " & args[i])
+        return 1
+      inc i
+    let agentDir = getAgentDir(agentDirOverride)
+    let trusted = resolveProjectTrust(cwd, agentDir, ptmAsk, cliOverride = (if approve: some(true) else: none(bool)))
+    let cfg = loadConfigBundle(cwd, agentDir, projectTrusted = trusted, loadContext = false)
+    try:
+      let config = findMcpConfig(cfg, args[1])
+      case action
+      of "login":
+        signInMcp(cfg, config, openBrowser = not noBrowser, announce = proc(url: string) =
+          stdout.writeLine("Authorize in a browser: " & url)
+          stdout.flushFile())
+        stdout.writeLine("Signed in to MCP server '" & config.name & "'.")
+      of "logout":
+        signOutMcp(cfg, config)
+        stdout.writeLine("Removed stored MCP credentials for '" & config.name & "'.")
+      of "enable", "disable":
+        setMcpEnabled(cfg, config, action == "enable", tool)
+        let target = if tool.len > 0: config.name & "/" & tool else: config.name
+        stdout.writeLine(action.capitalizeAscii() & "d " & target & ".")
+      of "reconnect":
+        let session = McpServerSession(config: config)
+        session.connectServer(cfg)
+        defer: session.closeServer()
+        if session.state != mcsConnected:
+          stderr.writeLine("MCP reconnect failed: " & (if session.lastError.len > 0: session.lastError else: $session.state))
+          return 1
+        stdout.writeLine("Connected to MCP server '" & config.name & "'.")
+      else: discard
+    except CatchableError as e:
+      stderr.writeLine(e.msg)
+      return 1
+    return 0
 
   of "add":
     if args.len < 2:
@@ -231,29 +302,23 @@ proc runMcpSubcommand(args: seq[string]): int =
       of "-l", "--local":
         localScope = true
       of "--agent-dir":
-        if i + 1 < args.len: agentDirOv = args[i + 1]; inc i
+        agentDirOv = optionValue(args, i)
       of "--url":
-        if i + 1 < args.len: url = args[i + 1]; inc i
+        url = optionValue(args, i)
       of "--exposure":
-        if i + 1 < args.len: exposure = parseToolExposure(args[i + 1]); inc i
+        exposure = parseToolExposure(optionValue(args, i))
       of "--description":
-        if i + 1 < args.len: desc = args[i + 1]; inc i
+        desc = optionValue(args, i)
       of "--env":
-        if i + 1 < args.len:
-          let kv = args[i + 1]
-          let eq = kv.find('=')
-          if eq > 0: envMap[kv[0 ..< eq]] = kv[eq + 1 .. ^1]
-          inc i
+        let kv = optionValue(args, i)
+        let eq = kv.find('=')
+        if eq > 0: envMap[kv[0 ..< eq]] = kv[eq + 1 .. ^1]
       of "--header":
-        if i + 1 < args.len:
-          let kv = args[i + 1]
-          let eq = kv.find('=')
-          if eq > 0: hdrMap[kv[0 ..< eq]] = kv[eq + 1 .. ^1]
-          inc i
+        let kv = optionValue(args, i)
+        let eq = kv.find('=')
+        if eq > 0: hdrMap[kv[0 ..< eq]] = kv[eq + 1 .. ^1]
       of "--bearer-token-env-var":
-        if i + 1 < args.len:
-          hdrMap["Authorization"] = "Bearer ${" & args[i + 1] & "}"
-          inc i
+        hdrMap["Authorization"] = "Bearer ${" & optionValue(args, i) & "}"
       else:
         cmdParts.add(a)
       inc i
@@ -293,9 +358,11 @@ proc runMcpSubcommand(args: seq[string]): int =
     let srvName = args[1]
     var localScope = false
     var agentDirOv = ""
-    for i in 2 ..< args.len:
+    var i = 2
+    while i < args.len:
       if args[i] in ["-l", "--local"]: localScope = true
-      elif args[i] == "--agent-dir" and i + 1 < args.len: agentDirOv = args[i + 1]
+      elif args[i] == "--agent-dir": agentDirOv = optionValue(args, i)
+      inc i
     let targetFile = if localScope:
       cwd / ProjectConfigDirName / "mcp.json"
     else:
@@ -352,6 +419,7 @@ proc main(): int =
   var appendPrompts: seq[string] = @[]
   var trustOverride = none(bool)
   var securityOv = none(SecurityMode)
+  var sandboxMode = sandboxOff
   var agentDirOv = ""
   var explicitFiles: seq[string] = @[]
   var promptWords: seq[string] = @[]
@@ -380,15 +448,20 @@ proc main(): int =
     of "-p", "--print":
       printMode = true
     of "--mode":
-      if i + 1 < rawArgs.len: outputMode = rawArgs[i + 1].toLowerAscii(); inc i
+      outputMode = optionValue(rawArgs, i).toLowerAscii()
+      if outputMode notin ["text", "json", "rpc"]:
+        raise newException(CliArgumentError, "--mode expects text, json, or rpc")
     of "-m", "--model":
-      if i + 1 < rawArgs.len: modelPat = rawArgs[i + 1]; inc i
+      modelPat = optionValue(rawArgs, i)
     of "--provider":
-      if i + 1 < rawArgs.len: providerOv = rawArgs[i + 1]; inc i
+      providerOv = optionValue(rawArgs, i)
     of "--api-key":
-      if i + 1 < rawArgs.len: cliApiKey = rawArgs[i + 1]; inc i
+      cliApiKey = optionValue(rawArgs, i)
     of "--thinking":
-      if i + 1 < rawArgs.len: thinkingOv = some(parseThinkingLevel(rawArgs[i + 1])); inc i
+      let level = optionValue(rawArgs, i).strip().toLowerAscii()
+      if level notin ["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"]:
+        raise newException(CliArgumentError, "--thinking expects off, minimal, low, medium, high, xhigh, or max")
+      thinkingOv = some(parseThinkingLevel(level))
     of "--list-models":
       listModelsFlag = true
       if i + 1 < rawArgs.len and not rawArgs[i + 1].startsWith("-"):
@@ -399,55 +472,59 @@ proc main(): int =
     of "-r", "--resume":
       resumePicker = true
     of "--session":
-      if i + 1 < rawArgs.len: sessionSpec = rawArgs[i + 1]; inc i
+      sessionSpec = optionValue(rawArgs, i)
     of "--session-id":
-      if i + 1 < rawArgs.len: customSessionId = rawArgs[i + 1]; inc i
+      customSessionId = optionValue(rawArgs, i)
+      if customSessionId.strip().len == 0 or customSessionId.find({'\0'..'\31', '/', '\\', ':', '*', '?', '"', '<', '>', '|'}) >= 0:
+        raise newException(CliArgumentError, "--session-id expects a nonempty ID without path separators or filename control characters")
     of "--fork":
-      if i + 1 < rawArgs.len: forkSpec = rawArgs[i + 1]; inc i
+      forkSpec = optionValue(rawArgs, i)
     of "--session-dir":
-      if i + 1 < rawArgs.len: cliSessionDir = rawArgs[i + 1]; inc i
+      cliSessionDir = optionValue(rawArgs, i)
     of "--no-session":
       noSession = true
     of "-n", "--name":
-      if i + 1 < rawArgs.len: sessionName = rawArgs[i + 1]; inc i
+      sessionName = optionValue(rawArgs, i)
     of "-t", "--tools":
-      if i + 1 < rawArgs.len:
-        for part in rawArgs[i + 1].split(','):
-          if part.strip().len > 0: toolsSpec.add(part.strip())
-        inc i
+      for part in optionValue(rawArgs, i).split(','):
+        if part.strip().len > 0: toolsSpec.add(part.strip())
     of "-nt", "--no-tools":
       noTools = true
     of "--no-mcp":
       noMcp = true
     of "--skill":
-      if i + 1 < rawArgs.len: extraSkills.add(rawArgs[i + 1]); inc i
+      extraSkills.add(optionValue(rawArgs, i))
     of "-ns", "--no-skills":
       noSkills = true
     of "--prompt-template":
-      if i + 1 < rawArgs.len: extraPrompts.add(rawArgs[i + 1]); inc i
+      extraPrompts.add(optionValue(rawArgs, i))
     of "-np", "--no-prompt-templates":
       noPrompts = true
     of "-nc", "--no-context-files":
       noContextFiles = true
     of "--system-prompt":
-      if i + 1 < rawArgs.len: sysPromptOv = rawArgs[i + 1]; inc i
+      sysPromptOv = optionValue(rawArgs, i)
     of "--append-system-prompt":
-      if i + 1 < rawArgs.len: appendPrompts.add(rawArgs[i + 1]); inc i
+      appendPrompts.add(optionValue(rawArgs, i))
     of "-a", "--approve":
       trustOverride = some(true)
     of "-na", "--no-approve":
       trustOverride = some(false)
     of "--security":
-      if i + 1 < rawArgs.len:
-        case rawArgs[i + 1].toLowerAscii()
-        of "strict": securityOv = some(smStrict)
-        of "permissive": securityOv = some(smPermissive)
-        else: securityOv = some(smBalanced)
-        inc i
+      case optionValue(rawArgs, i).toLowerAscii()
+      of "strict": securityOv = some(smStrict)
+      of "balanced": securityOv = some(smBalanced)
+      of "permissive": securityOv = some(smPermissive)
+      else: raise newException(CliArgumentError, "--security expects strict, balanced, or permissive")
     of "--yolo":
       securityOv = some(smPermissive)
+    of "--sandbox":
+      let mode = optionValue(rawArgs, i)
+      if mode notin ["off", "read-only", "workspace-write"]:
+        raise newException(CliArgumentError, "--sandbox expects off, read-only, or workspace-write")
+      sandboxMode = parseEnum[SandboxMode](mode)
     of "--agent-dir":
-      if i + 1 < rawArgs.len: agentDirOv = rawArgs[i + 1]; inc i
+      agentDirOv = optionValue(rawArgs, i)
     else:
       if a.startsWith("-"):
         stderr.writeLine("Unknown option: " & a & " (run `ni --help` for usage)")
@@ -472,16 +549,16 @@ proc main(): int =
     interactivePrompt = (if isInteractive: interactiveProjectTrustPrompt else: nil)
   )
 
-  let cfg = loadConfigBundle(cwd, agentDir, projectTrusted = projectTrusted, loadContext = not noContextFiles)
-  if sysPromptOv.len > 0:
-    cfg.customSystemPrompt = readTextOrFileArg(sysPromptOv, cwd)
+  let configOverrides = RuntimeConfigOverrides(
+    noContextFiles: noContextFiles, noSkills: noSkills, noPromptTemplates: noPrompts,
+    systemPrompt: (if sysPromptOv.len > 0: some(readTextOrFileArg(sysPromptOv, cwd)) else: none(string)),
+    securityMode: securityOv, extraSkills: extraSkills, extraPromptTemplates: extraPrompts
+  )
+  let cfg = loadRuntimeConfig(cwd, agentDir, projectTrusted, configOverrides)
 
   var resolvedAppends: seq[string] = @[]
   for ap in appendPrompts:
     resolvedAppends.add(readTextOrFileArg(ap, cwd))
-
-  if securityOv.isSome:
-    cfg.settings.securityMode = securityOv.get
 
   let provReg = newProviderRegistry(cfg)
 
@@ -513,39 +590,22 @@ proc main(): int =
   if (not stdin.isatty() or not stdout.isatty()) and outputMode == "text":
     printMode = true
 
-  # Assemble tools, MCP servers, and skills
-  var enabledTools = cfg.settings.defaultTools
-  if noTools:
-    enabledTools = @[]
-  elif toolsSpec.len > 0:
-    enabledTools = applyToolListSpec(enabledTools, toolsSpec)
+  if initialPrompt.strip().len == 0 and explicitFiles.len == 0:
+    if outputMode == "json":
+      raise newException(CliArgumentError, "--mode json requires a prompt argument or piped stdin")
+    if outputMode == "text" and printMode:
+      raise newException(CliArgumentError, "--print requires a prompt argument or piped stdin")
 
-  let toolReg = newToolRegistry(enabledTools)
-  let mcpMgr = if noMcp or noTools:
-    McpManager(servers: initOrderedTable[string, McpServerSession](), diagnostics: @[], workspaceRoot: cwd)
-  else:
-    newMcpManager(cfg, toolReg, connectNow = true)
-  defer:
-    mcpMgr.closeAll()
+  let secPolicy = newSecurityPolicy(
+    cwd, agentDir, cfg.settings.securityMode,
+    (if isInteractive: interactiveSecurityPrompt else: nil)
+  )
+  secPolicy.configureSandbox(sandboxMode)
+  defer: secPolicy.closeSandbox()
 
-  var skillList: seq[Skill] = @[]
-  if not noSkills:
-    let (sks, _) = discoverSkills(cwd, agentDir, cfg.settings.skills & extraSkills, projectTrusted = projectTrusted, includeDefaults = true)
-    skillList = sks
-  elif extraSkills.len > 0:
-    let (sks, _) = discoverSkills(cwd, agentDir, extraSkills, projectTrusted = projectTrusted, includeDefaults = false)
-    skillList = sks
-
-  var promptTplList: seq[PromptTemplate] = @[]
-  if not noPrompts:
-    let (tpls, _) = discoverPromptTemplates(cwd, agentDir, cfg.settings.prompts & extraPrompts, projectTrusted = projectTrusted, includeDefaults = true)
-    promptTplList = tpls
-  elif extraPrompts.len > 0:
-    let (tpls, _) = discoverPromptTemplates(cwd, agentDir, extraPrompts, projectTrusted = projectTrusted, includeDefaults = false)
-    promptTplList = tpls
-
-  # Resolve session (new, --continue, --resume, --session, or --fork)
+  # Claim the session before connecting MCP servers or starting a model request.
   let sessionsRoot = resolveSessionsRoot(cfg, cliSessionDir)
+  customSessionId = customSessionId.strip()
   var sessMgr: SessionManager = nil
 
   if forkSpec.len > 0:
@@ -553,7 +613,7 @@ proc main(): int =
     if found.isNone:
       stderr.writeLine("Session not found to fork: " & forkSpec)
       return 1
-    sessMgr = forkSession(found.get, cwd, sessionsRoot, customSessionId)
+    sessMgr = forkSession(found.get, cwd, sessionsRoot, customSessionId, persist = not noSession)
   elif sessionSpec.len > 0:
     let found = findSessionByIdOrPath(sessionsRoot, cwd, sessionSpec)
     if found.isNone:
@@ -566,28 +626,22 @@ proc main(): int =
       sessMgr = loadSessionFile(existing[0].filePath, persist = not noSession)
   elif resumePicker and isInteractive:
     let existing = listSessions(sessionsRoot, cwd)
-    if existing.len > 0:
-      var opts: seq[QuestionOption] = @[]
-      let cnt = min(15, existing.len)
-      for idx in 0 ..< cnt:
-        let s = existing[idx]
-        opts.add(QuestionOption(label: s.displayName, description: s.id[0 ..< min(8, s.id.len)] & " · " & $s.messageCount & " msgs"))
-      let pick = promptQuestionWidget(AskQuestionItem(
-        id: "cli_resume",
-        header: "Resume",
-        question: "Choose a session to resume:",
-        options: opts,
-        multiSelect: false,
-        allowOther: false
-      ))
-      if not pick.cancelled and pick.selected.len > 0:
-        for idx in 0 ..< cnt:
-          if opts[idx].label == pick.selected[0]:
-            sessMgr = loadSessionFile(existing[idx].filePath, persist = not noSession)
-            break
+    let chosen = pickSavedSession(existing)
+    if chosen >= 0:
+      sessMgr = loadSessionFile(existing[chosen].filePath, persist = not noSession)
+  elif not noSession and customSessionId.len > 0:
+    sessMgr = openNamedSession(cwd, sessionsRoot, customSessionId, sessionName)
 
   if sessMgr.isNil:
     sessMgr = newSessionManager(cwd, sessionsRoot, persist = not noSession, customSessionId = customSessionId, sessionName = sessionName)
+  defer: sessMgr.close()
+  for diagnostic in sessMgr.diagnostics:
+    stderr.writeLine("Warning: " & diagnostic)
+
+  let toolOverrides = if toolsSpec.len > 0: @[toolsSpec] else: @[]
+  let (toolReg, mcpMgr) = configureRuntimeTools(cfg, toolOverrides, noTools, noMcp, secPolicy)
+  defer: mcpMgr.closeAll()
+  let (skillList, promptTplList, _) = discoverRuntimeResources(cfg, configOverrides)
 
   # Resolve startup model and thinking level
   let (resolvedModel, suffixThink) = provReg.resolveModel(cfg, modelPat, providerOv, cliApiKey)
@@ -599,13 +653,6 @@ proc main(): int =
     startThinking = suffixThink.get
   if thinkingOv.isSome:
     startThinking = thinkingOv.get
-
-  let secPolicy = newSecurityPolicy(
-    cwd = cwd,
-    agentDir = agentDir,
-    mode = cfg.settings.securityMode,
-    prompt = (if isInteractive: interactiveSecurityPrompt else: nil)
-  )
 
   let rt = newAgentRuntime(
     cfg = cfg,
@@ -620,25 +667,31 @@ proc main(): int =
     cliApiKey = cliApiKey,
     cliAppendPrompts = resolvedAppends,
     askQuestion = (if isInteractive: promptAskQuestionsInteractive else: nil),
-    promptTemplates = promptTplList
+    promptTemplates = promptTplList,
+    keepModel = modelPat.len > 0 or providerOv.len > 0,
+    keepThinking = thinkingOv.isSome or suffixThink.isSome
   )
+  rt.configOverrides = configOverrides
+  rt.toolOverrides = toolOverrides
+  rt.noTools = noTools
+  rt.noMcp = noMcp
+  rt.sessionsRoot = sessionsRoot
+  defer: rt.session.close()
 
   if outputMode == "rpc":
     return runRpcMode(rt)
 
   if outputMode == "json":
-    if initialPrompt.strip().len == 0 and explicitFiles.len == 0:
-      stderr.writeLine("Error: --mode json requires a prompt argument or piped stdin")
-      return 1
     return runJsonMode(rt, initialPrompt, explicitFiles)
 
   if printMode:
-    if initialPrompt.strip().len == 0 and explicitFiles.len == 0:
-      stderr.writeLine("Error: --print requires a prompt argument or piped stdin")
-      return 1
     return runPrintMode(rt, initialPrompt, explicitFiles)
 
   runInteractiveRepl(rt, initialPrompt, explicitFiles)
 
 when isMainModule:
-  quit(main())
+  try:
+    quit(main())
+  except CliArgumentError, IOError, OSError:
+    stderr.writeLine("Error: " & getCurrentExceptionMsg())
+    quit(1)
