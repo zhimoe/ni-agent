@@ -394,6 +394,22 @@ suite "Fixed-layout transcript viewport (pinned dock, scrollback, sticky headers
     check paintDiff(@["alpha"], frame) == "\x1b[1;1Halpha\x1b[K\x1b[2;1Hbeta\x1b[K\x1b[3;1Hgamma\x1b[K"
     check paintDiff(frame, frame, fullRepaint = true).count("\x1b[") == 6
 
+  test "The native caret follows the visible editor row and wide characters":
+    let t = newTranscript()
+    let ed = newInputEditor()
+    let status = EditorStatusInfo(workingStatus: "Thinking (0s)")
+    var caret: EditorCaret
+
+    discard t.composeScreen(ed, status, 22, 16, addr caret)
+    check caret == (13, 2)
+    ed.setText("汉".repeat(12))
+    let wrapped = t.composeScreen(ed, status, 22, 16, addr caret)
+    check caret == (13, 8)
+    check "汉汉汉" in stripAnsi(wrapped[caret.row])
+    ed.cursorCol = "汉".len
+    discard t.composeScreen(ed, status, 22, 16, addr caret)
+    check caret == (12, 4)
+
   test "paintDiff shifts matching history rows while leaving the dock in place":
     let before = @["header", "one", "two", "three", "four", "five", "dock"]
     let after = @["header", "two", "three", "four", "five", "six", "dock"]
@@ -409,7 +425,7 @@ suite "Fixed-layout transcript viewport (pinned dock, scrollback, sticky headers
     check paintDiff(repeated, repeated, historyRows = 6, scrollRows = 1) == ""
 
   when defined(posix):
-    test "PTY repaint preserves the final page and coalesces streaming updates":
+    test "PTY repaint preserves history, streaming and terminal input fallbacks":
       let pythonExe = findExe("python3")
       let root = getCurrentDir()
       let niBin = root / addFileExt("ni", ExeExt)

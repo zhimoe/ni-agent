@@ -18,6 +18,8 @@ type
     contextPct: int
     activeTailLines*: seq[string]
     drawnFrame: seq[string]
+    when defined(windows):
+      drawnCaret: EditorCaret
     drawnSize: tuple[cols: int, rows: int]
     drawnHistory: tuple[rows, endLine: int]
     paintPending: bool
@@ -44,6 +46,7 @@ proc installCtrlCHandler() =
       if sigintCount >= 2:
         exitFullScreen()
         exitRawTerminalMode()
+        restoreTerminal()
         quit(130)
   )
 
@@ -224,7 +227,11 @@ proc paintScreen(vp: DockViewport) =
     vp.contextRevision = revision
   let second = if vp.workingPhase.len > 0: vp.elapsedWorkingSeconds() else: 0'i64
   let status = buildEditorStatus(rt, vp.gitBranch, vp.formatWorkingStatus(second), vp.contextPct)
-  let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows)
+  when defined(windows):
+    var caret: EditorCaret
+    let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows, addr caret)
+  else:
+    let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows)
   let history = vp.transcript.historyView()
   let scrollRows = if history.rows == vp.drawnHistory.rows:
     history.endLine - vp.drawnHistory.endLine else: 0
@@ -233,6 +240,11 @@ proc paintScreen(vp: DockViewport) =
     output.add("\x1b[2J")
   output.add(paintDiff(vp.drawnFrame, frame, fullRepaint = full,
     historyRows = history.rows, scrollRows = scrollRows))
+  when defined(windows):
+    # Keep the console's own caret at the editor position for IME composition.
+    if output.len > 0 or caret != vp.drawnCaret:
+      output.add("\x1b[" & $(caret.row + 1) & ";" & $(caret.col + 1) & "H")
+    vp.drawnCaret = caret
   if output.len > 0:
     # Keep wide glyphs from wrapping into adjacent rows during a diff repaint.
     writeSyncOutput("\x1b[?7l" & output & "\x1b[?7h")
@@ -1273,7 +1285,6 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
   ## Start the interactive ni TUI with a persistent docked input box and live Markdown rendering.
   installCtrlCHandler()
   let keyReady = rt.providerRegistry.resolveProviderApiKey(rt.cfg, rt.currentModel.provider, rt.cliApiKey).isSome
-  let interactive = isInteractiveTerminal()
 
   var banner: seq[string] = @[]
   banner.add(styleBold(styleCyan(NiEmoji & " ni v" & NiVersion)) & styleDim(" — Fast Nim coding agent (Pi config compatible)"))
@@ -1300,15 +1311,13 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
     modelItems = buildModelAutocompleteItems(rt)
   )
   let vp = newDockViewport(rt, ed)
-  if interactive:
+  if vp.fullScreen:
     enterRawTerminalMode()
-    if vp.fullScreen:
-      enterFullScreen()
+    enterFullScreen()
   defer:
-    if interactive:
+    if vp.fullScreen:
       vp.suspendDock()
-      if vp.fullScreen:
-        exitFullScreen()
+      exitFullScreen()
       exitRawTerminalMode()
 
   vp.restoreTranscript(banner)
@@ -1318,15 +1327,18 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       vp.beginUserTurn(initialPrompt, cols)
     else:
       vp.redrawDock()
-    runAgentTurnDocked(vp, initialPrompt, initialFiles)
+    if vp.fullScreen:
+      runAgentTurnDocked(vp, initialPrompt, initialFiles)
+    else:
+      discard rt.runPrompt(initialPrompt, initialFiles, onEvent = makeInteractiveEventPrinter(rt.cfg.settings.hideThinkingBlock))
 
-  # Non-TTY fallback (e.g. scripted pipe tests)
-  if not interactive:
+  # An inline editor or host-managed line input always remains available.
+  if not vp.fullScreen:
     while true:
       let status = buildEditorStatus(rt, vp.gitBranch)
       let outcome = ed.readPromptInteractive(status)
-      if outcome.kind != eokSubmit:
-        break
+      if outcome.kind == eokEof: break
+      if outcome.kind != eokSubmit: continue
       let trimmed = outcome.text.strip()
       if trimmed in ["/quit", "/exit", "/q"]:
         break

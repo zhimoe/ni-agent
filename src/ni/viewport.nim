@@ -149,14 +149,17 @@ proc renderHistory*(t: Transcript, width, rows: int): seq[string] =
     inc idx
     inc row
 
-proc composeScreen*(t: Transcript, ed: InputEditor, status: EditorStatusInfo, cols, rows: int): seq[string] =
+proc composeScreen*(t: Transcript, ed: InputEditor, status: EditorStatusInfo, cols, rows: int,
+                    caret: ptr EditorCaret = nil): seq[string] =
   ## Build one full-screen frame: scrollable transcript on top, docked input box + status line pinned to the bottom rows.
   ## The rightmost column is left free so painting a row can never trigger terminal auto-wrap.
   let width = max(1, cols - 1)
-  var dockLines = renderEditorFrame(ed, status, width, max(4, rows - 2))
+  var dockLines = renderEditorFrame(ed, status, width, max(4, rows - 2), caret)
   if dockLines.len > rows - 2:
     dockLines.setLen(max(1, rows - 2))
   let historyRows = max(0, rows - dockLines.len)
+  if not caret.isNil:
+    caret[].row += historyRows
   result = t.renderHistory(width, historyRows)
   for line in dockLines:
     result.add(fitScreenRow(line, width))

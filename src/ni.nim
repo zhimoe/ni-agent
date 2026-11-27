@@ -381,6 +381,11 @@ proc runMcpSubcommand(args: seq[string]): int =
 
 proc main(): int =
   initTerminal()
+  defer:
+    when defined(windows):
+      stdout.flushFile()
+      stderr.flushFile()
+    restoreTerminal()
   let rawArgs = commandLineParams()
   if rawArgs.len > 0:
     case rawArgs[0]
@@ -573,7 +578,7 @@ proc main(): int =
 
   # Read piped stdin when stdin is redirected
   var pipedInput = ""
-  if not stdin.isatty() and outputMode != "rpc":
+  if not isStdinTty() and outputMode != "rpc":
     try:
       pipedInput = stdin.readAll()
     except CatchableError:
@@ -587,7 +592,7 @@ proc main(): int =
       initialPrompt = pipedInput.strip()
 
   # Redirected stdin/stdout defaults to print mode (matching Pi CLI behavior)
-  if (not stdin.isatty() or not stdout.isatty()) and outputMode == "text":
+  if not isInteractiveTerminal() and outputMode == "text":
     printMode = true
 
   if initialPrompt.strip().len == 0 and explicitFiles.len == 0:

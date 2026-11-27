@@ -61,41 +61,127 @@ when defined(windows):
   const
     CP_UTF8_ID = 65001'u32
 
+  type ConsoleOutputMode = object
+    handle: Handle
+    original: DWORD
+    available: bool
+
+  var windowsVtOutput = false
+  var consoleOutputModes: array[2, ConsoleOutputMode]
+  var originalInputCodePage, originalOutputCodePage: uint32
+
+  proc getConsoleOutputCPWin(): uint32
+    {.stdcall, dynlib: "kernel32", importc: "GetConsoleOutputCP".}
+  proc getConsoleCPWin(): uint32
+    {.stdcall, dynlib: "kernel32", importc: "GetConsoleCP".}
   proc setConsoleOutputCPWin(wCodePageID: uint32): WINBOOL
     {.stdcall, dynlib: "kernel32", importc: "SetConsoleOutputCP".}
   proc setConsoleCPWin(wCodePageID: uint32): WINBOOL
     {.stdcall, dynlib: "kernel32", importc: "SetConsoleCP".}
 
+  proc isConsoleHandle(handle: Handle): bool =
+    var mode: DWORD
+    getConsoleMode(handle, addr mode) != 0
+
+  proc enableConsoleVtOutput(output: ConsoleOutputMode): bool =
+    if not output.available:
+      return false
+    let mode = output.original or ENABLE_PROCESSED_OUTPUT or ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    mode == output.original or setConsoleMode(output.handle, mode) != 0
+
+  proc readWideConsole(handle: Handle, buffer: pointer, capacity: DWORD, count: ptr DWORD,
+                       control: pointer): WINBOOL {.stdcall, dynlib: "kernel32", importc: "ReadConsoleW".}
+
+proc isStdinTty*(): bool =
+  when defined(windows): isConsoleHandle(getStdHandle(STD_INPUT_HANDLE))
+  else: stdin.isatty()
+
+proc isStdoutTty*(): bool =
+  when defined(windows): isConsoleHandle(getStdHandle(STD_OUTPUT_HANDLE))
+  else: stdout.isatty()
+
+proc supportsAnsiOutput*(): bool =
+  if not isStdoutTty() or getEnv("TERM").toLowerAscii() == "dumb":
+    return false
+  when defined(windows): windowsVtOutput
+  else: true
+
 proc initTerminal*() =
   ## Enable UTF-8 and ANSI Virtual Terminal sequences (including native Windows Terminal / Conhost).
   when defined(windows):
-    discard setConsoleOutputCPWin(CP_UTF8_ID)
-    discard setConsoleCPWin(CP_UTF8_ID)
-    for hid in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]:
-      let h = getStdHandle(hid)
-      var mode: DWORD = 0
-      if getConsoleMode(h, addr mode) != 0:
-        discard setConsoleMode(h, mode or ENABLE_PROCESSED_OUTPUT or ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    if isStdinTty():
+      let codePage = getConsoleCPWin()
+      if codePage != 0 and codePage != CP_UTF8_ID and setConsoleCPWin(CP_UTF8_ID) != 0:
+        originalInputCodePage = codePage
+    # Stdout and stderr can refer to the same console screen buffer. Read
+    # both original modes before setting either one.
+    for i, id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]:
+      let handle = getStdHandle(id)
+      var mode: DWORD
+      let available = getConsoleMode(handle, addr mode) != 0
+      consoleOutputModes[i] = ConsoleOutputMode(handle: handle, original: mode, available: available)
+    if consoleOutputModes[0].available or consoleOutputModes[1].available:
+      let codePage = getConsoleOutputCPWin()
+      if codePage != 0 and codePage != CP_UTF8_ID and setConsoleOutputCPWin(CP_UTF8_ID) != 0:
+        originalOutputCodePage = codePage
+    windowsVtOutput = enableConsoleVtOutput(consoleOutputModes[0])
+    discard enableConsoleVtOutput(consoleOutputModes[1])
 
-  let noColor = getEnv("NO_COLOR").len > 0 or getEnv("TERM").toLowerAscii() == "dumb"
-  colorsEnabled = (not noColor) and stdin.isatty() and stdout.isatty()
+  colorsEnabled = getEnv("NO_COLOR").len == 0 and isStdinTty() and supportsAnsiOutput()
+
+proc restoreTerminal*() =
+  when defined(windows):
+    for output in consoleOutputModes.mitems:
+      if output.available:
+        discard setConsoleMode(output.handle, output.original)
+        output.available = false
+    windowsVtOutput = false
+    if originalInputCodePage != 0:
+      discard setConsoleCPWin(originalInputCodePage)
+      originalInputCodePage = 0
+    if originalOutputCodePage != 0:
+      discard setConsoleOutputCPWin(originalOutputCodePage)
+      originalOutputCodePage = 0
 
 proc isInteractiveTerminal*(): bool =
   ## Return true when both stdin and stdout are attached to an interactive TTY.
-  stdin.isatty() and stdout.isatty()
-
-proc isStdoutTty*(): bool =
-  ## Return true when stdout is attached to a TTY.
-  stdout.isatty()
+  isStdinTty() and isStdoutTty()
 
 var fullScreenActive = false
 
 proc supportsFullScreen*(): bool =
   ## Return true when the terminal can host the fixed-layout alternate screen (interactive, non-dumb).
-  if not isInteractiveTerminal():
+  if not isInteractiveTerminal() or not supportsAnsiOutput():
     return false
-  let term = getEnv("TERM").toLowerAscii()
-  term.len > 0 and term != "dumb"
+  when defined(windows): true # CMD and Windows Terminal can leave TERM unset.
+  else: getEnv("TERM").len > 0
+
+proc readTerminalLine*(line: var string): bool =
+  ## Let the console host edit and compose a full line when raw input is unavailable.
+  when defined(windows):
+    if isStdinTty():
+      let handle = getStdHandle(STD_INPUT_HANDLE)
+      var originalMode: DWORD
+      if getConsoleMode(handle, addr originalMode) != 0:
+        let cooked = (originalMode or ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT or ENABLE_PROCESSED_INPUT) and
+          not DWORD(ENABLE_VIRTUAL_TERMINAL_INPUT)
+        if cooked != originalMode and setConsoleMode(handle, cooked) == 0:
+          return false
+        defer:
+          if cooked != originalMode: discard setConsoleMode(handle, originalMode)
+        var units: seq[Utf16Char]
+        var buffer: array[512, Utf16Char]
+        while true:
+          var count: DWORD
+          if readWideConsole(handle, addr buffer[0], DWORD(buffer.len), addr count, nil) == 0 or count == 0:
+            return false
+          units.add(buffer.toOpenArray(0, count.int - 1))
+          if cast[uint16](units[^1]) == 10:
+            break
+        units.add(Utf16Char(0))
+        line = strutils.strip($cast[WideCString](addr units[0]), leading = false, chars = {'\r', '\n'})
+        return line != "\x1a"
+  stdin.readLine(line)
 
 proc fullScreenEnabled*(): bool =
   ## Return true while the alternate screen buffer is active.
@@ -157,18 +243,18 @@ const
 
 proc beginSyncOutput*() =
   ## Enter DEC mode 2026 synchronized terminal output to prevent redraw flicker.
-  if stdout.isatty():
+  if supportsAnsiOutput():
     stdout.write(BeginSyncSequence)
 
 proc endSyncOutput*() =
   ## Exit DEC mode 2026 synchronized terminal output and flush stdout.
-  if stdout.isatty():
+  if supportsAnsiOutput():
     stdout.write(EndSyncSequence)
   stdout.flushFile()
 
 proc writeSyncOutput*(output: string) =
   ## Submit an already composed frame in one buffered write.
-  if stdout.isatty():
+  if supportsAnsiOutput():
     stdout.write(BeginSyncSequence & output & EndSyncSequence)
   else:
     stdout.write(output)
@@ -176,13 +262,13 @@ proc writeSyncOutput*(output: string) =
 
 proc enableBracketedPaste*() =
   ## Enable xterm bracketed paste mode (`\x1b[200~` ... `\x1b[201~`).
-  if stdout.isatty():
+  if supportsAnsiOutput():
     stdout.write("\x1b[?2004h")
     stdout.flushFile()
 
 proc disableBracketedPaste*() =
   ## Disable xterm bracketed paste mode cleanly before running child processes or exiting.
-  if stdout.isatty():
+  if supportsAnsiOutput():
     stdout.write("\x1b[?2004l")
     stdout.flushFile()
 
@@ -687,8 +773,9 @@ proc enterRawTerminalMode*() =
   if rawModeDepth == 0:
     if not setRawInputMode():
       return
-    stdout.write("\x1b[?25l")
-    enableBracketedPaste()
+    if supportsAnsiOutput():
+      stdout.write("\x1b[?25l")
+      enableBracketedPaste()
   inc rawModeDepth
 
 proc exitRawTerminalMode*() =
@@ -700,7 +787,7 @@ proc exitRawTerminalMode*() =
     return
   restoreInputMode()
   disableBracketedPaste()
-  if stdout.isatty():
+  if supportsAnsiOutput():
     stdout.write("\x1b[?25h")
     stdout.flushFile()
 
@@ -729,6 +816,11 @@ when defined(windows):
       if highSurrogate != 0:
         return $Rune(0x10000 + ((highSurrogate - 0xd800) shl 10) + unit - 0xdc00)
       return ""
+
+    # IME commits can carry the virtual key used to choose the candidate.
+    # Prefer its translated Unicode unit over navigation or submission keys.
+    if unit >= 0x80:
+      return $Rune(unit)
 
     case record.wVirtualKeyCode
     of 0x08: return (if alt or ctrl: "\x17" else: "\x7f") # Backspace
@@ -828,7 +920,7 @@ proc decodeInputKey(first: int): KeyEvent =
   of 8, 127: return KeyEvent(kind: kkBackspace)
   of 9: return KeyEvent(kind: kkTab)
   of 10:
-    if not stdin.isatty():
+    if not isStdinTty():
       return KeyEvent(kind: kkEnter)
     return KeyEvent(kind: kkNewline, ch: '\n', text: "\n")
   of 11: return KeyEvent(kind: kkCtrlK)
@@ -881,7 +973,7 @@ proc decodeInputKey(first: int): KeyEvent =
 
 proc readRawKey*(): KeyEvent =
   ## Read a navigation, control, Unicode text, or bracketed-paste event without echo.
-  let temporaryRawMode = rawModeDepth == 0 and stdin.isatty() and setRawInputMode()
+  let temporaryRawMode = rawModeDepth == 0 and isStdinTty() and setRawInputMode()
   defer:
     if temporaryRawMode:
       restoreInputMode()
@@ -900,7 +992,7 @@ proc pollRawKeyNonBlocking*(timeoutMs = 0): Option[KeyEvent] =
 
 proc clearRenderedLines*(lineCount: int) =
   ## Move cursor up lineCount rows and clear each row cleanly.
-  if lineCount <= 0 or not stdout.isatty():
+  if lineCount <= 0 or not supportsAnsiOutput():
     return
   for _ in 0 ..< lineCount:
     stdout.write("\x1b[1A\x1b[2K\r")

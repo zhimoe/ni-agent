@@ -29,8 +29,20 @@ def read_repaints(master, marker=b""):
     raise AssertionError(f"Timed out waiting for TUI repaint {marker!r}: {output[-1000:]!r}")
 
 
+def read_until(master, marker):
+    output = bytearray()
+    deadline = time.monotonic() + 5
+    while marker not in output:
+        remaining = max(0, deadline - time.monotonic())
+        if not select.select([master], [], [], remaining)[0]:
+            raise AssertionError(f"Timed out waiting for {marker!r}: {output[-1000:]!r}")
+        output.extend(os.read(master, 65536))
+    return output
+
+
 start_model = threading.Event()
 resume_model = threading.Event()
+unicode_prompt = "中文🙂"
 
 
 class ModelServer(http.server.BaseHTTPRequestHandler):
@@ -44,11 +56,17 @@ class ModelServer(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def do_POST(self):
-        self.rfile.read(int(self.headers["Content-Length"]))
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+        if request["messages"][-1]["content"] == unicode_prompt:
+            choice = {"delta": {"content": "echo:" + unicode_prompt}, "finish_reason": "stop"}
+            self.write_chunk(("data: " + json.dumps({"choices": [choice]}) + "\n\n").encode())
+            self.write_chunk(b"data: [DONE]\n\n")
+            self.write_chunk(b"")
+            return
         start_model.wait(timeout=6)
         for i in range(120):
             text = {59: "STREAM_HOLD", 119: "STREAM_DONE"}.get(i, f"Streaming chunk {i:03d}\n\n")
@@ -202,4 +220,35 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
         process.wait(timeout=5)
         os.close(master)
         os.close(slave)
-        server.shutdown()
+
+    # Terminal sessions with no alternate screen must still accept a Unicode prompt.
+    for term in (None, "dumb"):
+        fallback_env = env.copy()
+        fallback_env.pop("TERM")
+        if term is not None:
+            fallback_env["TERM"] = term
+        master, slave = pty.openpty()
+        process = subprocess.Popen(command, cwd=root, env=fallback_env, stdin=slave, stdout=slave, stderr=slave)
+        try:
+            if term is None:
+                shown = read_repaints(master, marker=b"Ask anything")
+                assert b"\x1b[?1049h" not in shown
+                os.write(master, unicode_prompt.encode() + b"\r")
+                output = read_repaints(master, marker=b"Ask anything")
+            else:
+                shown = read_until(master, b"ni> ")
+                os.write(master, unicode_prompt.encode() + b"\r")
+                output = read_until(master, b"ni> ")
+                assert b"\x1b[" not in shown + output
+            assert ("echo:" + unicode_prompt).encode() in output
+            os.write(master, b"/quit\r")
+            submitted = "❯ /quit\r\n".encode() if term is None else b"/quit\r\n"
+            read_until(master, submitted)
+            assert process.wait(timeout=5) == 0
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            os.close(master)
+            os.close(slave)
+    server.shutdown()
