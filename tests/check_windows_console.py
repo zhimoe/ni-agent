@@ -6,6 +6,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import queue
 import struct
 import subprocess
 import sys
@@ -24,6 +25,7 @@ class ModelServer(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         content = request["messages"][-1]["content"]
+        self.server.prompts.put(content)
         chunk = {"choices": [{"delta": {"content": "ECHO:" + str(content)}, "finish_reason": "stop"}]}
         body = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
         self.send_response(200)
@@ -109,6 +111,7 @@ def check_console(binary, root):
     agent = root / "agent"
     agent.mkdir()
     with http.server.ThreadingHTTPServer(("127.0.0.1", 0), ModelServer) as server:
+        server.prompts = queue.Queue()
         threading.Thread(target=server.serve_forever, daemon=True).start()
         (agent / "models.json").write_text(json.dumps({"providers": {"fixture": {
             "api": "openai-completions", "apiKey": "test", "models": [{"id": "echo"}],
@@ -130,7 +133,8 @@ def check_console(binary, root):
                     try:
                         wait_for(label, child)
                         send_keys(keys, PROMPT + "\r")
-                        wait_for("ECHO:" + PROMPT, child)
+                        assert server.prompts.get(timeout=8) == PROMPT
+                        wait_for("ECHO:", child)
                         wait_for(label, child)
                         send_keys(keys, "/quit\r")
                         assert child.wait(timeout=8) == 0
@@ -150,6 +154,7 @@ def check_console(binary, root):
                                      capture_output=True, env=env, cwd=root, timeout=8)
             assert printed.returncode == 0, printed.stderr
             assert ("ECHO:" + PROMPT).encode() in printed.stdout
+            assert server.prompts.get(timeout=8) == PROMPT
             rpc = subprocess.run(command + ["--mode", "rpc"], input=b'{"type":"bash","command":"echo NI_CMD_OK"}\n',
                                  capture_output=True, env=env, cwd=root, timeout=8)
             assert rpc.returncode == 0, rpc.stderr
@@ -178,5 +183,7 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory(prefix="ni-win-console-") as tmp:
             child = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--child", str(binary), tmp],
                                    creationflags=subprocess.CREATE_NEW_CONSOLE, timeout=45)
-            print((Path(tmp) / "report.txt").read_text(encoding="utf-8"), end="")
+            report = Path(tmp) / "report.txt"
+            assert report.is_file(), f"The console helper exited with code {child.returncode} without writing a report"
+            sys.stdout.buffer.write(report.read_bytes())
             sys.exit(child.returncode)

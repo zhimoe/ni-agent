@@ -53,13 +53,15 @@ jobs:
           retention-days: 3
 
   windows:
-    name: Windows ${{ matrix.arch }} runtime
+    name: Windows ${{ matrix.arch }} ${{ matrix.test }}
     needs: build
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 7
     strategy:
       fail-fast: false
       matrix:
+        arch: [x64, arm64]
+        test: [console, integration]
         include:
           - arch: x64
             runner: windows-2025
@@ -93,12 +95,15 @@ jobs:
           .\ni.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Native console, Unicode and redirection
+        if: matrix.test == 'console'
+        timeout-minutes: 2
         shell: pwsh
         run: |
           python tests/check_windows_console.py .\ni.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Session, Shell, RPC and MCP regression suite
-        if: always() && steps.prepare.outcome == 'success'
+        if: matrix.test == 'integration'
+        timeout-minutes: 4
         shell: pwsh
         run: |
           .\test-all.exe

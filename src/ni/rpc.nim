@@ -1,6 +1,8 @@
 # Headless JSONL RPC mode (`ni --mode rpc`) compatible with Pi's stdin/stdout embedding protocol.
 
 import std/[deques, json, options, strutils, tables]
+when defined(windows):
+  import std/winlean
 import ./[types, config, provider, tools, skills, session, agent, tui, utf8]
 
 type
@@ -18,9 +20,33 @@ type
     id: JsonNode
     payload: JsonNode
 
+when defined(windows):
+  proc readRpcPipe(input: ptr Channel[RpcInput], handle: Handle) =
+    var buffer: array[4096, char]
+    var partial = ""
+    while true:
+      var size: int32
+      if readFile(handle, addr buffer[0], buffer.len.int32, addr size, nil) == 0 or size == 0:
+        break
+      for i in 0 ..< size.int:
+        if buffer[i] == '\n':
+          if partial.len > 0:
+            input[].send(RpcInput(kind: rikLine, line: partial))
+          partial = ""
+        else:
+          partial.add(buffer[i])
+    if partial.len > 0:
+      input[].send(RpcInput(kind: rikLine, line: partial))
+
 proc readRpcInput(input: ptr Channel[RpcInput]) {.thread.} =
   # The reader only transfers lines. The agent thread owns JSON parsing, state changes, and stdout.
   try:
+    when defined(windows):
+      let handle = Handle(stdin.getOsFileHandle())
+      var mode: DWORD
+      if getConsoleMode(handle, addr mode) == 0:
+        readRpcPipe(input, handle)
+        return
     var line = ""
     while stdin.readLine(line):
       if line.len > 0:
