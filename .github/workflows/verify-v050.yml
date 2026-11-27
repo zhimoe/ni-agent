@@ -1,115 +1,38 @@
-name: Ni 0.5.0 release verification
+name: Stage verified Ni 0.5.0 release assets
 
 on:
   push:
     branches: [ci/release-v0.5.0]
 
 permissions:
-  contents: read
+  contents: write
+  actions: read
 
 jobs:
-  build:
-    name: Build both Windows architectures
+  stage:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - name: Set up Nim and Zig
-        shell: bash
+      - name: Confirm the successful verification and draft
         run: |
-          tool_dir="$RUNNER_TEMP/toolchain"
-          mkdir -p "$tool_dir/nim" "$tool_dir/zig"
-          curl --retry 3 -fsSL https://nim-lang.org/download/nim-2.4.2-linux_x64.tar.xz -o "$tool_dir/nim.tar.xz"
-          curl --retry 3 -fsSL https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz -o "$tool_dir/zig.tar.xz"
-          cd "$tool_dir"
-          echo '0ee5b16e81852a956d4fddb4aa44b5958c645c992132fa43be45f489573ee325  nim.tar.xz' | sha256sum -c
-          echo '3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  zig.tar.xz' | sha256sum -c
-          tar -xJf nim.tar.xz -C nim --strip-components=1
-          tar -xJf zig.tar.xz -C zig --strip-components=1
-          printf '%s\n' "$tool_dir/nim/bin" "$tool_dir/zig" >> "$GITHUB_PATH"
-      - name: Linux integration and terminal regression
-        shell: bash
-        run: |
-          nimble test
-          test "$(./ni --version)" = 'ni 0.5.0'
-      - name: Build Windows packages and the native regression binaries
-        shell: bash
-        run: |
-          python3 scripts/package_windows.py --arch all
-          for arch in x64 arm64; do
-            case "$arch" in
-              x64) cpu=amd64; target=x86_64-windows-gnu ;;
-              arm64) cpu=arm64; target=aarch64-windows-gnu ;;
-            esac
-            wrapper="$RUNNER_TEMP/zig-test-$arch"
-            printf '#!/bin/sh\nexec zig cc -target %s "$@"\n' "$target" > "$wrapper"
-            chmod +x "$wrapper"
-            nim c --os:windows "--cpu:$cpu" --cc:clang "--clang.exe:$wrapper" \
-              "--clang.linkerexe:$wrapper" "--nimcache:$RUNNER_TEMP/test-cache-$arch" \
-              "-o:dist/windows/$arch/test-all.exe" tests/test_all.nim
-          done
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: ni-v050-verified-packages
-          path: dist/windows
-          if-no-files-found: error
-          retention-days: 3
-
-  windows:
-    name: Windows ${{ matrix.arch }} ${{ matrix.test }}
-    needs: build
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 7
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x64, arm64]
-        test: [console, integration]
-        include:
-          - arch: x64
-            runner: windows-2025
-          - arch: arm64
-            runner: windows-11-arm
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        with:
-          python-version: '3.13'
-          architecture: ${{ matrix.arch }}
+          test "$(gh run view 46002002144 --json conclusion --jq .conclusion)" = success
+          test "$(gh release view v0.5.0 --json isDraft --jq .isDraft)" = true
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           name: ni-v050-verified-packages
           path: audit-bin
-      - name: Prepare and identify the packaged binaries
-        id: prepare
-        shell: pwsh
+          github-token: ${{ github.token }}
+          run-id: 46002002144
+      - name: Verify the packages and stage them on GitHub Releases
+        shell: bash
         run: |
-          Copy-Item "audit-bin/${{ matrix.arch }}/*" .
-          $pythonPath = (Get-Command python.exe).Source
-          $pythonDirectory = Split-Path $pythonPath
-          if (-not (Test-Path "$pythonDirectory/python3.exe")) {
-            Copy-Item $pythonPath "$pythonDirectory/python3.exe"
-          }
-          python3 --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Output "Windows architecture $env:PROCESSOR_ARCHITECTURE"
-          $version = .\ni.exe --version
-          if ($LASTEXITCODE -ne 0 -or $version -ne 'ni 0.5.0') { throw "Unexpected version $version" }
-      - name: Native console, Unicode and redirection
-        if: matrix.test == 'console'
-        timeout-minutes: 2
-        shell: pwsh
-        run: |
-          python tests/check_windows_console.py .\ni.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Session, Shell, RPC and MCP regression suite
-        if: matrix.test == 'integration'
-        timeout-minutes: 4
-        shell: pwsh
-        run: |
-          .\test-all.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python3 .github/release/verify-assets.py audit-bin release-assets
+          (cd release-assets && sha256sum -c SHA256SUMS)
+          cat release-assets/SHA256SUMS
+          gh release upload v0.5.0 release-assets/*
+          gh release view v0.5.0 --json assets --jq '.assets[] | {name,size,digest}'
