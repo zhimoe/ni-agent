@@ -22,6 +22,7 @@
 - `decodeCsiSequence` 只从以 `M` 结尾的 SGR 报告产生纵向滚动事件。只屏蔽 Shift、Meta、Ctrl 的 `4`、`8`、`16` 修饰位，再精确匹配按钮号 `64`（向上）和 `65`（向下）。横向 `66`、`67` 和以 `m` 结尾的释放报告保持纵向视口位置。仅凭滚轮位和奇偶性判断方向会把横向输入转换成纵向输入。 [XTerm 鼠标报告格式](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Extended-coordinates)
 - 历史区在两页之间来回跳三行且输入栏稳定时，先对照鼠标输入与视口偏移，再检查帧输出。触控板手势可以同时产生纵向与横向报告。旧版在触底后把 `66` 当成向上滚一格，下一条 `65` 又把历史推回底部。复现与实测见 [触底跳动故障记录](docs/tui-rendering-study.md#触控板到达底部后的跳动)。
 - 修改鼠标解码、事件合并或滚动边界时，保留混合滚轮方向的 PTY 回归。让报告分别跨过 12 ms 合并窗口，当前测试对每条报告观察 150 ms。空闲触底时，逐条断言额外向下、横向和释放报告产生零字节 PTY 输出。另须验证带修饰键的纵向报告仍能滚动，紧随滚轮的普通按键仍能输入。只比较最后一帧会漏掉中间跳动。 [PTY 滚动回归](tests/check_tui_scroll.py)
+- 开启鼠标上报后，Herdr 会把左键拖动交给 Ni。接收鼠标按住时的移动上报，按已提交帧的显示列取文本，丢弃 ANSI 和输入光标标记。修改时同时验证历史区、中文草稿的复制和滚轮滚动。 [PTY 拖选回归](tests/check_tui_scroll.py) · [Herdr 0.9.5 鼠标路由](https://github.com/herdrdev/herdr/blob/v0.9.5/src/client/shell/mouse.rs)
 
 ## 行宽、Unicode 和 ANSI
 
@@ -42,3 +43,5 @@
 ```sh
 python3 tests/check_tui_scroll.py "$PWD/ni"
 ```
+
+发布前按 [功能验收清单](docs/feature-checklist.md#每次发布怎么验收) 复测。模型工具和用户输入的 `!` 分别测试，`/copy` 和拖选复制分别测试。用原生控制台验证 Windows，覆盖降级输入和终端模式还原。

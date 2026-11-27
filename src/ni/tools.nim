@@ -756,6 +756,34 @@ proc runUserShell*(command, cwd: string, settings: NiSettings, policy: SecurityP
   let (wrappedExe, wrappedArgs) = policy.wrapProcess(exe, args & @[command], cwd)
   runProcessCapture(wrappedExe, wrappedArgs, cwd, policy.processEnvironment(), timeoutSec, abort, onOutput = onOutput)
 
+proc runInteractiveUserShell*(command, cwd: string, settings: NiSettings, policy: SecurityPolicy,
+                              abort: AbortFlag):
+    tuple[output: string, exitCode: int, timedOut: bool, aborted: bool, wallSec: float] =
+  ## Load user aliases for commands typed at the prompt. Automation and sandboxed commands keep their existing shell.
+  when not defined(windows):
+    if policy.isNil or policy.sandboxMode == sandboxOff:
+      let configured = settings.shellPath.strip()
+      let preferred = if configured.len > 0: configured else: getEnv("SHELL")
+      let shell = if preferred.isAbsolute:
+        (if fileExists(preferred): preferred else: "")
+      elif preferred.len > 0 and DirSep notin preferred: findExe(preferred)
+      else: ""
+      let shellName = extractFilename(shell)
+      if shellName in ["bash", "zsh"]:
+        # Ignore prompt/plugin startup output once the shell reaches the user's command.
+        let marker = "\x1eNi-shell-" & $getMonoTime().ticks & "\x1f"
+        let script = "builtin printf '%s\\n' " & quoteShell(marker) & "\n" & command
+        # The captured child is in its own process group, behind the TUI.
+        let args = if shellName == "zsh": @["-o", "NO_MONITOR", "-ic", script]
+          else: @["+m", "-ic", script]
+        result = runProcessCapture(shell, args, cwd, policy.processEnvironment(), 0, abort)
+        let boundary = marker & "\n"
+        let start = result.output.find(boundary)
+        if start >= 0:
+          result.output = result.output[start + boundary.len .. ^1]
+        return
+  runUserShell(command, cwd, settings, policy, abort)
+
 # 5. `ls` tool
 
 proc execLsTool(args: JsonNode, ctx: ToolContext): ToolOutput =

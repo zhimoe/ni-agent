@@ -42,7 +42,7 @@ Windows 控制台的交互模式以 `GetConsoleMode` 的结果为准。管道、
 python tests/check_windows_console.py dist/windows/x64/ni.exe
 ```
 
-实际输入法的候选窗口和选字仍需分别在传统 CMD 和 Windows Terminal 中验证。自动测试通过 Windows 控制台 API 注入已转换的 Unicode 字符。对话中的历史可用 Page Up、Page Down 和 End 导航，当前 Win32 输入路径只读取键盘记录。Windows 上 `--sandbox read-only` 和 `--sandbox workspace-write` 会明确报错，因为暂未提供受限子进程后端。
+实际输入法的候选窗口和选字仍需分别在传统 CMD 和 Windows Terminal 中验证。自动测试通过 Windows 控制台 API 注入已转换的 Unicode 字符。全屏时可用鼠标滚轮、Page Up、Page Down 和 End 浏览历史。拖选可见的历史或输入框文字，松开鼠标即可复制。Windows 上 `--sandbox read-only` 和 `--sandbox workspace-write` 会明确报错，因为暂未提供受限子进程后端。
 
 ## 在 macOS 或 Linux 重新打包
 

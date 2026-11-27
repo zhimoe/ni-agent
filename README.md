@@ -44,6 +44,7 @@ Choose **Reload config** in Herdr (default `Ctrl+B`, then `Shift+R`). Press `Ctr
 
 - **Providers.** OpenAI Chat Completions and Responses, Anthropic Messages, Google Gemini, and OpenAI-compatible endpoints such as DeepSeek, Kimi, OpenRouter, Ollama, and vLLM. The provider adapters preserve supported thinking signatures across turns.
 - **Terminal interface.** Stream Markdown, tables, code, and diffs. Edit multiline input with UTF-8 and CJK support, prompt history, command completion, and `@file` completion. During a reply, `Enter` queues a steering message, and `Alt+Enter` (`Ctrl+Q` on Windows) queues a follow-up. Configure the follow-up shortcut with `app.message.followUp` in `~/.pi/agent/keybindings.json`. `Esc` interrupts a model reply and keeps the draft.
+- **Local commands and copying.** Type `!command` to run a local command and add its output to context, or use `!!command` to keep it local. On macOS and Linux, local commands load interactive aliases when Bash or Zsh is selected and the sandbox is off. In fullscreen, drag across the visible transcript or draft and release to copy the selection.
 - **Workspace tools.** Read, write, edit, run shell commands, search and list files, ask questions, and discover deferred tools. Fuzzy edits preserve the original BOM and line endings. Use `/copy` to copy a reply, code block, or diff.
 - **Configuration.** Reuse Pi settings, models, credentials, project trust, skills, and prompt templates. Ni supports stdio and Streamable HTTP MCP servers and manages them with `ni mcp list`, `add`, and `remove`.
 
@@ -83,4 +84,4 @@ nimble test
 
 The test task rebuilds Ni and runs unit and integration tests. The integration tests use local mock servers and require Python 3.
 
-See [Architecture](docs/architecture.md) for the runtime and module layout, the [CLI agent comparison](docs/cli-agent-comparison.md) for the feature baseline, and [TODO](TODO.md) for the required follow-up work. Ni is distributed under the [MIT License](LICENSE).
+See the [0.5.0 feature checklist](docs/feature-checklist.md) for everyday workflows, verified behavior, and remaining gaps. The [CLI agent comparison](docs/cli-agent-comparison.md) covers the earlier audit and [TODO](TODO.md) tracks follow-up work. [Architecture](docs/architecture.md) describes the runtime and module layout. Ni is distributed under the [MIT License](LICENSE).

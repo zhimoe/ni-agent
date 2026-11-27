@@ -1,6 +1,6 @@
 # Interactive multi-line TUI input editor: UTF-8/CJK cursor editing, undo/kill-ring, persistent history, bracketed paste markers, $EDITOR, and /command + @file autocomplete.
 
-import std/[algorithm, json, options, os, osproc, strutils, tables, unicode]
+import std/[algorithm, json, options, os, osproc, parseutils, strutils, tables, unicode]
 import ./[brand, terminal_io]
 
 const
@@ -300,6 +300,20 @@ proc expandedText*(ed: InputEditor): string =
   ## Return editor buffer with any `[paste #N ...]` chips expanded to full text.
   expandPasteMarkers(ed.currentText(), ed.pastes)
 
+func shellPrefixLen*(text: string, start = 0): int =
+  ## Number of ASCII bangs consumed by the shell prefix at the first nonblank byte.
+  let first = start + skipWhitespace(text, start)
+  if first < text.len and text[first] == '!':
+    return (if first + 1 < text.len and text[first + 1] == '!': 2 else: 1)
+
+proc shellPrefixLen(ed: InputEditor): int =
+  if ed.pastes.len > 0:
+    return shellPrefixLen(ed.expandedText())
+  for line in ed.lines:
+    let first = skipWhitespace(line)
+    if first < line.len:
+      return shellPrefixLen(line, first)
+
 proc setText*(ed: InputEditor, text: string) =
   ## Replace editor buffer with text and place cursor at the end.
   let norm = text.replace("\r\n", "\n").replace('\r', '\n')
@@ -439,6 +453,7 @@ proc refreshAutocomplete*(ed: InputEditor) =
   ed.acItems.setLen(0)
   ed.acIndex = 0
   ed.acMovedSelection = false
+  if ed.shellPrefixLen() > 0: return
 
   let line = ed.lines[ed.cursorLine]
   let uptoCursor = line[0 ..< clamp(ed.cursorCol, 0, line.len)]
@@ -666,6 +681,8 @@ proc handleKeyEvent*(ed: InputEditor, ev: KeyEvent, allowExternalEditor = false)
       ed.acKind = ackNone
       ed.acItems.setLen(0)
       ed.acMovedSelection = false
+    elif ed.shellPrefixLen() > 0:
+      ed.resetBuffer()
     return none(EditorOutcome)
 
   of kkTab:
@@ -702,6 +719,8 @@ proc handleKeyEvent*(ed: InputEditor, ev: KeyEvent, allowExternalEditor = false)
 
     let disp = ed.currentText()
     let full = ed.expandedText()
+    if full.strip() in ["!", "!!"]:
+      return none(EditorOutcome)
     ed.appendEditorHistory(full)
     ed.resetBuffer()
     return some(EditorOutcome(kind: eokSubmit, text: full, displayText: disp))
@@ -1025,11 +1044,16 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
 
   if showWorking:
     result.add(truncateVisible("  " & status.workingStatus, cols))
-  let border = styleDim("─".repeat(cols))
-  result.add(border)
+  let shellPrefix = ed.shellPrefixLen()
+  let rule = "─".repeat(cols)
+  if shellPrefix > 0:
+    let label = truncateVisible(if shellPrefix == 2: "── Bash · Local only " else: "── Bash ", cols)
+    result.add(styleYellow(label & "─".repeat(cols - visibleWidth(label))))
+  else:
+    result.add(styleDim(rule))
 
-  let prefixFirst = styleBold(styleCyan("❯ "))
-  let prefixCont = styleDim("· ")
+  let prefixFirst = if shellPrefix > 0: styleYellow("$ ") else: styleBold(styleCyan("❯ "))
+  let prefixCont = if shellPrefix > 0: styleYellow("· ") else: styleDim("· ")
   let contentWidth = max(10, cols - 3)
 
   let isEmpty = ed.lines.len == 1 and ed.lines[0].len == 0
@@ -1061,7 +1085,7 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
       caret[] = (result.len + cursor.row - firstRow, cursor.col + 2)
     result.add(wrappedInput[firstRow ..< min(wrappedInput.len, firstRow + inputRows)])
 
-  result.add(border)
+  result.add(if shellPrefix > 0: styleYellow(rule) else: styleDim(rule))
 
   # Two-column justified footer matching Pi's FooterComponent:
   # Left:  🌿 ni · ~/workspace (branch) [• sessionName]
@@ -1185,7 +1209,7 @@ proc readPromptInteractive*(ed: InputEditor, status: EditorStatusInfo): EditorOu
       beginSyncOutput()
       clearRenderedLines(renderedCount)
       renderedCount = 0
-      if outcome.kind == eokSubmit and outcome.displayText.strip().len > 0:
+      if outcome.kind == eokSubmit and outcome.displayText.strip().len > 0 and shellPrefixLen(outcome.text) == 0:
         let lines = outcome.displayText.split('\n')
         stdout.write(styleBold(styleCyan("❯ ")) & styleBold(lines[0]) & "\n")
         for i in 1 ..< lines.len:

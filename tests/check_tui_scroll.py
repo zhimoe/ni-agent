@@ -1,5 +1,6 @@
 """Exercise scrolling and streaming against the real fullscreen TUI."""
 
+from base64 import b64encode
 import fcntl
 import http.server
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shutil
 import struct
 import subprocess
 import sys
@@ -40,9 +42,18 @@ def read_until(master, marker):
     return output
 
 
+def drag_copy(master, row, first, last, expected):
+    os.write(master, f"\x1b[<0;{first};{row}M\x1b[<32;{last};{row}M".encode())
+    preview = read_repaints(master, marker=b"\x1b[7m")
+    assert b"\x1b[2J" not in preview
+    os.write(master, f"\x1b[<0;{last};{row}m".encode())
+    read_repaints(master, marker=b"\x1b]52;c;" + b64encode(expected.encode()) + b"\x07")
+
+
 start_model = threading.Event()
 resume_model = threading.Event()
 unicode_prompt = "中文🙂"
+model_requests = []
 
 
 class ModelServer(http.server.BaseHTTPRequestHandler):
@@ -57,6 +68,7 @@ class ModelServer(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        model_requests.append(request["messages"])
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
@@ -119,6 +131,18 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
     env = {**os.environ, "TERM": "xterm-256color", "NO_COLOR": "1"}
     env.pop("HTTPS_PROXY", None)
     env.pop("HTTP_PROXY", None)
+    shell = shutil.which("zsh") or shutil.which("bash")
+    if shell:
+        env.update(HOME=tmp, ZDOTDIR=tmp, SHELL=shell)
+        (root / (".zshrc" if Path(shell).name == "zsh" else ".bashrc")).write_text(
+            'echo shell-startup-log\nalias ll=\'printf "%s\\n" shell-alias-ran\'\n')
+    mock_bin = root / "bin"
+    mock_bin.mkdir()
+    for utility in ("pbcopy", "wl-copy", "xclip", "xsel"):
+        executable = mock_bin / utility
+        executable.write_text("#!/bin/sh\n/bin/cat >/dev/null\n")
+        executable.chmod(0o755)
+    env["PATH"] = str(mock_bin) + os.pathsep + env["PATH"]
     command = [sys.argv[1], "--no-session", "--no-mcp", "--agent-dir", str(agent_dir),
                "--model", "local-test/stream", "--session", str(session)]
     process = subprocess.Popen(command, cwd=root, env=env, stdin=slave, stdout=slave, stderr=slave)
@@ -129,6 +153,15 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
         assert b"Latest reply" in initial and len(bottom) == 20
         assert b"\t" not in initial
         assert b"7 tok" in bottom[20]
+
+        history_row, history_line = next((row, text) for row, text in bottom.items() if b"Latest reply" in text)
+        first = history_line.index(b"Latest reply") + 1
+        drag_copy(master, history_row, first, first + len("Latest reply") - 1, "Latest reply")
+        os.write(master, "中文 draft".encode())
+        read_repaints(master, marker="中文 draft".encode())
+        drag_copy(master, 18, 3, 12, "中文 draft")
+        os.write(master, b"\x15")
+        read_repaints(master, marker=b"Ask anything")
 
         os.write(master, b"\x1b[<64;20;5M" * 12)
         up = read_repaints(master)
@@ -173,6 +206,19 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
         refresh = read_repaints(master)
         assert b"\x1b[2J" not in refresh and b"Latest reply" in refresh
 
+        os.write(master, b"\x15!")
+        shell_mode = read_repaints(master, marker=b"Bash")
+        assert b"\x1b[2J" not in shell_mode
+        os.write(master, b"!")
+        read_repaints(master, marker=b"Local only")
+        os.write(master, b"\x1b")
+        read_repaints(master, marker=b"Ask anything")
+
+        if shell:
+            os.write(master, b"!ll\r")
+            shell_alias = read_repaints(master, marker=b"shell-alias-ran")
+            assert b"shell-startup-log" not in shell_alias
+
         os.write(master, b"\x15!printf 'clear-before\\033[2Jclear-after\\n'\r")
         shell_result = read_repaints(master, marker=b"clear-beforeclear-after")
         assert b"\x1b[2J" not in shell_result
@@ -205,12 +251,15 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
         os.write(master, b"\x1b[<65;20;5M")
         apply_repaints(live_screen, read_repaints(master, marker=b"lines above"))
         assert any(b"STREAM_HOLD" in row for row in live_screen.values())
+        os.write(master, b"!!printf 'queued-%s\\n' 'shell-done'\r")
+        read_repaints(master, marker=b"Queued: !!printf")
         resume_model.set()
-        final = read_repaints(master, marker=b"34 tok")
+        final = read_repaints(master, marker=b"queued-shell-done")
         apply_repaints(live_screen, final)
         assert any(b"STREAM_DONE" in row for row in live_screen.values())
         assert b"Generating" not in live_screen[16]
         assert b"34 tok" in live_screen[20]
+        assert len(model_requests) == 1
         frames = (first + final).count(b"\x1b[?2026h")
         assert frames < 60, frames
     finally:
@@ -233,14 +282,26 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
             if term is None:
                 shown = read_repaints(master, marker=b"Ask anything")
                 assert b"\x1b[?1049h" not in shown
+                os.write(master, b"!echo public-fallback\r")
+                read_repaints(master, marker=b"Ask anything")
+                os.write(master, b"!!echo private-fallback\r")
+                read_repaints(master, marker=b"Ask anything")
                 os.write(master, unicode_prompt.encode() + b"\r")
                 output = read_repaints(master, marker=b"Ask anything")
             else:
                 shown = read_until(master, b"ni> ")
+                os.write(master, b"!echo public-fallback\r")
+                shell_output = read_until(master, b"ni> ")
+                assert b"  public-fallback" in shell_output
+                os.write(master, b"!!echo private-fallback\r")
+                shell_output = read_until(master, b"ni> ")
+                assert b"  private-fallback" in shell_output
                 os.write(master, unicode_prompt.encode() + b"\r")
                 output = read_until(master, b"ni> ")
                 assert b"\x1b[" not in shown + output
             assert ("echo:" + unicode_prompt).encode() in output
+            request = json.dumps(model_requests[-1])
+            assert "public-fallback" in request and "private-fallback" not in request
             os.write(master, b"/quit\r")
             submitted = "❯ /quit\r\n".encode() if term is None else b"/quit\r\n"
             read_until(master, submitted)

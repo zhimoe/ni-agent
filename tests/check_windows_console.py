@@ -1,4 +1,4 @@
-"""Smoke-test Ni in an isolated Windows console with Unicode key records."""
+"""Smoke-test Ni in an isolated Windows console with Unicode keys and mouse records."""
 
 import ctypes
 from ctypes import wintypes
@@ -53,6 +53,8 @@ def check_console(binary, root):
     kernel.GetConsoleScreenBufferInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(ScreenInfo)]
     kernel.ReadConsoleOutputCharacterW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
                                                     Coord, ctypes.POINTER(wintypes.DWORD)]
+    kernel.ReadConsoleOutputAttribute.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.WORD), wintypes.DWORD,
+                                                  Coord, ctypes.POINTER(wintypes.DWORD)]
     kernel.WriteConsoleInputW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
                                          ctypes.POINTER(wintypes.DWORD)]
 
@@ -70,7 +72,7 @@ def check_console(binary, root):
         require(kernel.GetConsoleMode(handle, ctypes.byref(value)))
         return value.value
 
-    def screen():
+    def screen_rows():
         output = open_console("CONOUT$")
         try:
             info = ScreenInfo()
@@ -83,9 +85,12 @@ def check_console(binary, root):
             for y in range(top, bottom + 1):
                 require(kernel.ReadConsoleOutputCharacterW(output, row, width, Coord(left, y), ctypes.byref(chars)))
                 lines.append(row[:chars.value])
-            return "\n".join(lines).encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+            return left, top, lines
         finally:
             kernel.CloseHandle(output)
+
+    def screen():
+        return "\n".join(screen_rows()[2]).encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
 
     def wait_for(label, process):
         deadline = time.monotonic() + 8
@@ -98,15 +103,55 @@ def check_console(binary, root):
             time.sleep(0.04)
         raise AssertionError(f"Did not see {label!r} in the console:\n{contents}")
 
+    def send_records(handle, records):
+        size = len(records) // 20
+        count = wintypes.DWORD()
+        require(kernel.WriteConsoleInputW(handle, ctypes.create_string_buffer(records), size,
+                                          ctypes.byref(count)))
+        assert count.value == size
+
     def send_keys(handle, text):
-        units = text.encode("utf-16-le")
         # INPUT_RECORD starts with a WORD event type, then padding and a KEY_EVENT_RECORD.
         records = b"".join(struct.pack("<H2xiHHHHI", 1, 1, 1, 0x0D if unit == 13 else 0xE7, 0, unit, 0)
-                           for unit, in struct.iter_unpack("<H", units))
-        count = wintypes.DWORD()
-        require(kernel.WriteConsoleInputW(handle, ctypes.create_string_buffer(records), len(units) // 2,
-                                          ctypes.byref(count)))
-        assert count.value == len(units) // 2
+                           for unit, in struct.iter_unpack("<H", text.encode("utf-16-le")))
+        send_records(handle, records)
+
+    def check_mouse_selection(keys, phrase, child):
+        left, top, rows = screen_rows()
+        row, line = next((i, text) for i, text in enumerate(rows) if phrase in text)
+        first = left + line.index(phrase)
+        last, y = first + len(phrase) - 1, top + row
+
+        def attribute():
+            output = open_console("CONOUT$")
+            try:
+                value, count = wintypes.WORD(), wintypes.DWORD()
+                require(kernel.ReadConsoleOutputAttribute(output, ctypes.byref(value), 1, Coord(first, y),
+                                                         ctypes.byref(count)))
+                assert count.value == 1
+                return value.value
+            finally:
+                kernel.CloseHandle(output)
+
+        def wait_for_attribute(initial, selected):
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                if (attribute() != initial) == selected:
+                    return
+                assert child.poll() is None
+                time.sleep(0.03)
+            raise AssertionError(f"Console selection highlighting did not change as expected for {phrase!r}")
+
+        initial = attribute()
+        press = struct.pack("<H2xhhIII", 2, first, y, 1, 0, 0)
+        drag = struct.pack("<H2xhhIII", 2, last, y, 1, 0, 1)
+        send_records(keys, press + drag)
+        wait_for_attribute(initial, selected=True)
+        # A vertical wheel report cancels selection. Cancel before release to leave the clipboard untouched.
+        wheel = struct.pack("<H2xhhIII", 2, last, y, (120 << 16) | 1, 0, 4)
+        release = struct.pack("<H2xhhIII", 2, last, y, 0, 0, 0)
+        send_records(keys, wheel + release)
+        wait_for_attribute(initial, selected=False)
 
     agent = root / "agent"
     agent.mkdir()
@@ -136,6 +181,15 @@ def check_console(binary, root):
                         assert server.prompts.get(timeout=8) == PROMPT
                         wait_for("ECHO:", child)
                         wait_for(label, child)
+                        if term is None:
+                            send_keys(keys, "!echo NI_TUI_SHELL_OK\r")
+                            wait_for("  NI_TUI_SHELL_OK", child)
+                            wait_for(label, child)
+                            phrase = "mouse-selection-probe"
+                            send_keys(keys, phrase)
+                            wait_for(phrase, child)
+                            check_mouse_selection(keys, phrase, child)
+                            send_keys(keys, "\b" * len(phrase))
                         send_keys(keys, "/quit\r")
                         assert child.wait(timeout=8) == 0
                     finally:
@@ -184,7 +238,7 @@ if __name__ == "__main__":
         report = Path(sys.argv[3]) / "report.txt"
         try:
             check_console(sys.argv[2], report.parent)
-            report.write_text("Windows console, Unicode input, NUL redirection and console restoration passed.\n")
+            report.write_text("Windows console, Unicode input, mouse selection, NUL redirection and console restoration passed.\n")
         except Exception:
             import traceback
             report.write_text(traceback.format_exc(), encoding="utf-8")

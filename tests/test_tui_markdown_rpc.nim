@@ -111,6 +111,39 @@ suite "TUI Layout, Multi-line Input Editor, and Terminal Markdown Renderer":
     discard ed2.handleKeyEvent(KeyEvent(kind: kkUp))
     check "lineE" in ed2.currentText()
 
+  test "An initial ASCII bang switches the dock to Bash mode without moving the caret":
+    let prevColors = colorsActive()
+    setColorsEnabled(true)
+    defer: setColorsEnabled(prevColors)
+    let ed = newInputEditor(workspaceRoot = getTempDir())
+    let status = EditorStatusInfo()
+    discard ed.handleKeyEvent(KeyEvent(kind: kkChar, text: "!"))
+    var caret: EditorCaret
+    let single = renderEditorFrame(ed, status, 40, caret = addr caret)
+    check "Bash" in stripAnsi(single[0])
+    check single[0].startsWith("\x1b[33m")
+    check "\x1b[33m$ " in single[1]
+    check caret == (1, 3)
+    check ed.handleKeyEvent(KeyEvent(kind: kkEnter)).isNone
+    check ed.currentText() == "!"
+
+    discard ed.handleKeyEvent(KeyEvent(kind: kkChar, text: "!"))
+    check "Local only" in stripAnsi(renderEditorFrame(ed, status, 40)[0])
+    discard ed.handleKeyEvent(KeyEvent(kind: kkBackspace))
+    check "Local only" notin stripAnsi(renderEditorFrame(ed, status, 40)[0])
+    discard ed.handleKeyEvent(KeyEvent(kind: kkEscape))
+    check ed.currentText().len == 0
+    check "Bash" notin stripAnsi(renderEditorFrame(ed, status, 40)[0])
+
+    let pasted = "!!echo one\necho two\necho three\necho four"
+    discard ed.handleKeyEvent(KeyEvent(kind: kkPaste, text: pasted))
+    check "Local only" in stripAnsi(renderEditorFrame(ed, status, 40)[0])
+    check ed.handleKeyEvent(KeyEvent(kind: kkEnter)).get.text == pasted
+    ed.setText("中文！ Keep this punctuation!")
+    check "Bash" notin stripAnsi(renderEditorFrame(ed, status, 40)[0])
+    ed.setText("！echo literal")
+    check "Bash" notin stripAnsi(renderEditorFrame(ed, status, 40)[0])
+
   test "Short terminals keep the active editor row and autocomplete within the dock":
     let ed = newInputEditor()
     let draft = "start\n" & "你好\n".repeat(10) & "finish"
@@ -392,6 +425,22 @@ suite "Fixed-layout transcript viewport (pinned dock, scrollback, sticky headers
     check short.len == 6
     check "draft prompt" in stripAnsi(short[^3])
     check "1.2k tok" in stripAnsi(short[^1])
+
+  test "Screen selection copies displayed Chinese, combining marks, and draft text without ANSI":
+    let prevColors = colorsActive()
+    setColorsEnabled(true)
+    defer: setColorsEnabled(prevColors)
+    let selection = ScreenSelection(anchor: (1, 4), head: (0, 3))
+    var frame = @["  " & styleCyan("中e\u0301") & " ", "draft followed by other text"]
+    check frame.selectedText(selection, (-1, -1)) == "中e\u0301\ndraft"
+    frame.highlightSelection(selection)
+    check frame[0].contains("\x1b[22;27;97;44m")
+    check frame.selectedText(selection, (-1, -1)) == "中e\u0301\ndraft"
+
+    setColorsEnabled(false)
+    let draft = @["❯ in▏put"]
+    let wholeDraft = ScreenSelection(anchor: (0, 2), head: (0, 7))
+    check draft.selectedText(wholeDraft, (0, 4)) == "input"
 
   test "paintDiff only repaints changed rows":
     let frame = @["alpha", "beta", "gamma"]

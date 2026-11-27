@@ -17,9 +17,10 @@ type
     contextRevision: tuple[session: SessionManager, leafId: string, config: ConfigBundle, window: int]
     contextPct: int
     activeTailLines*: seq[string]
+    queuedShellCommands: seq[string]
+    mouseSelection: Option[ScreenSelection]
     drawnFrame: seq[string]
-    when defined(windows):
-      drawnCaret: EditorCaret
+    drawnCaret: EditorCaret
     drawnSize: tuple[cols: int, rows: int]
     drawnHistory: tuple[rows, endLine: int]
     paintPending: bool
@@ -220,18 +221,19 @@ proc paintScreen(vp: DockViewport) =
   let full = cols != vp.drawnSize.cols or rows != vp.drawnSize.rows
   if full:
     vp.drawnFrame.setLen(0)
+    vp.mouseSelection = none(ScreenSelection)
   let rt = vp.rt
   let revision = (rt.session, rt.session.leafId, rt.cfg, rt.currentModel.contextWindow)
   if revision != vp.contextRevision:
     vp.contextPct = rt.estimateEditorContextPct()
     vp.contextRevision = revision
   let second = if vp.workingPhase.len > 0: vp.elapsedWorkingSeconds() else: 0'i64
-  let status = buildEditorStatus(rt, vp.gitBranch, vp.formatWorkingStatus(second), vp.contextPct)
-  when defined(windows):
-    var caret: EditorCaret
-    let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows, addr caret)
-  else:
-    let frame = vp.transcript.composeScreen(vp.ed, status, cols, rows)
+  var status = buildEditorStatus(rt, vp.gitBranch, vp.formatWorkingStatus(second), vp.contextPct)
+  status.queuedMessages.add(vp.queuedShellCommands)
+  var caret: EditorCaret
+  var frame = vp.transcript.composeScreen(vp.ed, status, cols, rows, addr caret)
+  if vp.mouseSelection.isSome:
+    frame.highlightSelection(vp.mouseSelection.get)
   let history = vp.transcript.historyView()
   let scrollRows = if history.rows == vp.drawnHistory.rows:
     history.endLine - vp.drawnHistory.endLine else: 0
@@ -244,7 +246,7 @@ proc paintScreen(vp: DockViewport) =
     # Keep the console's own caret at the editor position for IME composition.
     if output.len > 0 or caret != vp.drawnCaret:
       output.add("\x1b[" & $(caret.row + 1) & ";" & $(caret.col + 1) & "H")
-    vp.drawnCaret = caret
+  vp.drawnCaret = caret
   if output.len > 0:
     # Keep wide glyphs from wrapping into adjacent rows during a diff repaint.
     writeSyncOutput("\x1b[?7l" & output & "\x1b[?7h")
@@ -287,6 +289,7 @@ proc suspendDock*(vp: DockViewport) =
   if vp.isDockedActive():
     clearFullScreen()
   vp.drawnFrame.setLen(0)
+  vp.mouseSelection = none(ScreenSelection)
   vp.suspended = true
 
 proc resumeDock*(vp: DockViewport) =
@@ -329,7 +332,28 @@ proc pollDockKey(vp: DockViewport, timeoutMs: int): Option[KeyEvent] =
     result = pollRawKeyNonBlocking(timeoutMs)
 
 proc handleDockKey(vp: DockViewport, ev: KeyEvent): Option[EditorOutcome] =
+  if ev.kind in {kkMousePress, kkMouseDrag, kkMouseRelease, kkMouseOther}:
+    if vp.isDockedActive() and vp.drawnFrame.len > 0:
+      let point: ScreenPoint = (clamp(ev.mouse.row, 0, vp.drawnFrame.high),
+                                clamp(ev.mouse.col, 0, vp.drawnSize.cols - 1))
+      case ev.kind
+      of kkMousePress:
+        vp.mouseSelection = some(ScreenSelection(anchor: point, head: point))
+      of kkMouseDrag, kkMouseRelease:
+        if vp.mouseSelection.isSome:
+          var selection = vp.mouseSelection.get
+          let moved = selection.anchor != selection.head
+          selection.head = point
+          if ev.kind == kkMouseDrag:
+            vp.mouseSelection = some(selection)
+          else:
+            vp.mouseSelection = none(ScreenSelection)
+            if moved or selection.anchor != selection.head:
+              discard copyToClipboard(vp.drawnFrame.selectedText(selection, vp.drawnCaret))
+      else: discard
+    return none(EditorOutcome)
   if vp.applyScrollKey(ev):
+    vp.mouseSelection = none(ScreenSelection)
     if ev.kind in {kkScrollUp, kkScrollDown}:
       # Trackpads can send many wheel reports per frame. Keep the first
       # non-wheel key for the normal input loop.
@@ -1059,7 +1083,7 @@ proc helpMarkdown(): string =
 | `/skills` · `/prompts` · `/mcp` | List Agent Skills, Markdown prompt templates, or MCP servers |
 | `/tools` · `/trust` · `/reload` | Toggle tools, manage project trust, or reload `~/.pi/agent` config |
 | `/login` · `/logout` · `/hotkeys` | Manage provider credentials in `auth.json` or view editor shortcuts |
-| `!<cmd>` · `!!<cmd>` | Run shell command (included in context vs. excluded from context) |
+| `!<cmd>` · `!!<cmd>` | Enter Bash mode. `!` adds the result to context. `!!` keeps it local. |
 """
 
 proc hotkeysMarkdown(): string =
@@ -1069,6 +1093,7 @@ proc hotkeysMarkdown(): string =
 | Keys | Action |
 | :--- | :--- |
 | `Enter` | Submit prompt or queue a steering message during a reply |
+| `!` at the start | Open Bash mode. `Enter` runs the command or queues it until the reply finishes. |
 | `Alt+Enter` (`Ctrl+Q` on Windows) | Default shortcut to queue a follow-up after the current reply |
 | `Ctrl+J` / `Shift+Enter` | Insert newline (or end line with `\`) |
 | `Tab` / `Shift+Tab` | Trigger or accept `/command`, `/model`, and `@file` autocomplete |
@@ -1258,7 +1283,9 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
         let inputKey = if followUp: KeyEvent(kind: kkEnter) else: kev
         let outOpt = vp.handleDockKey(inputKey)
         if outOpt.isSome and outOpt.get.kind == eokSubmit and outOpt.get.text.strip().len > 0:
-          if followUp:
+          if shellPrefixLen(outOpt.get.text) > 0:
+            vp.queuedShellCommands.add(outOpt.get.text)
+          elif followUp:
             rt.followUpQueue.add(QueuedPrompt(text: outOpt.get.text))
           else:
             rt.steeringQueue.add(QueuedPrompt(text: outOpt.get.text))
@@ -1342,11 +1369,75 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       exitFullScreen()
       exitRawTerminalMode()
 
+  proc tryRunShell(input: string): bool =
+    let trimmed = input.strip()
+    let prefix = shellPrefixLen(trimmed)
+    if prefix == 0: return false
+    let command = trimmed[prefix .. ^1].strip()
+    if command.len == 0:
+      vp.redrawDock()
+      return true
+
+    reporter.report(hsWorking)
+    let runAbort = newAbortFlag()
+    activeRunAbort = runAbort
+    defer:
+      activeRunAbort = nil
+      vp.setWorkingStatus()
+      vp.redrawDock()
+      reporter.report(hsIdle)
+    if vp.fullScreen:
+      runAbort.onIdle = proc() =
+        let key = vp.pollDockKey(0)
+        if key.isSome:
+          if key.get.kind in {kkEscape, kkCtrlC, kkEof}: runAbort.aborted = true
+          elif key.get.kind notin {kkEnter, kkAltEnter}:
+            discard vp.handleDockKey(key.get)
+            vp.redrawDock()
+        vp.refreshWorkingPaint()
+
+    let commandLines = stripAnsi(command).split('\n')
+    var header = @["  " & styleYellow("$ " & commandLines[0])]
+    for i in 1 ..< commandLines.len:
+      header.add("    " & commandLines[i])
+    vp.workingStarted = getMonoTime()
+    vp.setWorkingStatus("Running shell", commandLines[0])
+    if vp.fullScreen:
+      discard vp.transcript.beginSegment(segNotice, "$ " & commandLines[0])
+    vp.redrawDock(header)
+    let res = try:
+      runInteractiveUserShell(command, rt.cfg.cwd, rt.cfg.settings, rt.security, runAbort)
+    except CatchableError as e:
+      vp.printAboveDock("  " & styleRed(e.msg))
+      return true
+
+    let output = res.output.replace("\r\n", "\n")
+    var lines: seq[string]
+    let shownOutput = if vp.fullScreen: output else: stripAnsi(output)
+    if shownOutput.len > 0:
+      for line in shownOutput.strip(leading = false, trailing = true).split('\n'):
+        lines.add("  " & line)
+    if res.exitCode != 0:
+      lines.add("  " & styleYellow("[exit code " & $res.exitCode & "]"))
+    lines.add("")
+    if prefix == 1:
+      let trunc = truncateHead(output)
+      discard rt.session.appendMessage(newUserMessage(
+        "<user_shell command=\"" & command & "\" exit_code=\"" & $res.exitCode & "\">\n" & trunc.content & "\n</user_shell>"
+      ))
+    vp.printAboveDock(lines)
+    ed.invalidateFileCache()
+    true
+
   proc runTurn(prompt: string, explicitFiles: seq[string] = @[]) =
     reporter.report(hsWorking)
     defer: reporter.report(hsIdle)
     if vp.fullScreen:
       runAgentTurnDocked(vp, prompt, explicitFiles)
+      while vp.queuedShellCommands.len > 0:
+        let command = vp.queuedShellCommands[0]
+        vp.queuedShellCommands.delete(0)
+        discard tryRunShell(command)
     else:
       discard rt.runPrompt(prompt, explicitFiles, onEvent = makeInteractiveEventPrinter(rt.cfg.settings.hideThinkingBlock))
 
@@ -1371,7 +1462,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       let trimmed = outcome.text.strip()
       if trimmed in ["/quit", "/exit", "/q"]:
         break
-      if trimmed.len > 0:
+      if trimmed.len > 0 and not tryRunShell(trimmed):
         runTurn(outcome.text)
     return 0
 
@@ -1423,54 +1514,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
 
     let (cols, _) = terminalSize()
 
-    # 1. `!cmd` (in context) and `!!cmd` (excluded from context)
-    if trimmed.startsWith("!") and trimmed.len > 1:
-      let excludeCtx = trimmed.startsWith("!!")
-      let shCmd = (if excludeCtx: trimmed[2 .. ^1] else: trimmed[1 .. ^1]).strip()
-      if shCmd.len == 0:
-        vp.redrawDock()
-        continue
-      reporter.report(hsWorking)
-      defer: reporter.report(hsIdle)
-      discard vp.transcript.beginSegment(segNotice, "$ " & shCmd)
-      vp.redrawDock(@["  " & styleCyan("$ " & shCmd)])
-      let runAbort = newAbortFlag()
-      activeRunAbort = runAbort
-      runAbort.onIdle = proc() =
-        let key = vp.pollDockKey(0)
-        if key.isSome:
-          if key.get.kind in {kkEscape, kkCtrlC, kkEof}: runAbort.aborted = true
-          elif key.get.kind notin {kkEnter, kkAltEnter}:
-            discard vp.handleDockKey(key.get)
-            vp.redrawDock()
-        vp.refreshWorkingPaint()
-      vp.workingStarted = getMonoTime()
-      vp.setWorkingStatus("Running shell", shCmd)
-      vp.redrawDock()
-      let res = try:
-        runUserShell(shCmd, rt.cfg.cwd, rt.cfg.settings, rt.security, runAbort)
-      except CatchableError as e:
-        activeRunAbort = nil
-        vp.setWorkingStatus()
-        vp.printAboveDock("  " & styleRed(e.msg))
-        continue
-      activeRunAbort = nil
-      vp.setWorkingStatus()
-      var outLines: seq[string] = @[]
-      if res.output.len > 0:
-        for ol in res.output.replace("\r\n", "\n").strip(leading = false, trailing = true).split('\n'):
-          outLines.add("  " & ol)
-      if res.exitCode != 0:
-        outLines.add("  " & styleYellow("[exit code " & $res.exitCode & "]"))
-      outLines.add("")
-      if not excludeCtx:
-        let trunc = truncateHead(res.output.replace("\r\n", "\n"))
-        discard rt.session.appendMessage(newUserMessage(
-          "<user_shell command=\"" & shCmd & "\" exit_code=\"" & $res.exitCode & "\">\n" & trunc.content & "\n</user_shell>"
-        ))
-      vp.printAboveDock(outLines)
-      ed.invalidateFileCache()
-      continue
+    if tryRunShell(trimmed): continue
 
     # 2. Slash commands (except `/skill:<name>` and matching `/<prompt-template>`, which run as agent prompts)
     if trimmed.startsWith("/") and not trimmed.startsWith("/skill:"):

@@ -15,6 +15,9 @@ type
     kind*: SegmentKind
     title*: string
 
+  ScreenSelection* = object
+    anchor*, head*: ScreenPoint
+
   Transcript* = ref object
     ## Committed transcript rows plus the live (re-rendered) tail, grouped into message segments.
     segments*: seq[Segment]
@@ -170,6 +173,30 @@ proc composeScreen*(t: Transcript, ed: InputEditor, status: EditorStatusInfo, co
 
 proc historyView*(t: Transcript): tuple[rows, endLine: int] =
   (t.visibleRows, t.totalLines() - t.scrollUp)
+
+proc selectionBounds(selection: ScreenSelection): tuple[first, last: ScreenPoint] =
+  if selection.anchor <= selection.head: (selection.anchor, selection.head)
+  else: (selection.head, selection.anchor)
+
+proc selectionColumns(first, last: ScreenPoint, row: int): tuple[start, past: int] =
+  let start = if row == first.row: first.col else: 0
+  let past = if row == last.row: last.col + 1 else: high(int)
+  (start, past)
+
+proc highlightSelection*(frame: var seq[string], selection: ScreenSelection) =
+  if selection.anchor == selection.head: return
+  let (first, last) = selection.selectionBounds()
+  for row in first.row .. min(last.row, frame.high):
+    let (start, past) = selectionColumns(first, last, row)
+    frame[row] = selectScreenCells(frame[row], start, past, paint = true)
+
+proc selectedText*(frame: openArray[string], selection: ScreenSelection, caret: ScreenPoint): string =
+  let (first, last) = selection.selectionBounds()
+  for row in first.row .. min(last.row, frame.high):
+    if row > first.row: result.add('\n')
+    let (start, past) = selectionColumns(first, last, row)
+    let marker = if not colorsActive() and caret.row == row: caret.col else: -1
+    result.add(selectScreenCells(frame[row], start, past, cursorMarker = marker).strip(leading = false, chars = {' '}))
 
 proc paintDiff*(previous, frame: seq[string], fullRepaint = false,
                 historyRows = 0, scrollRows = 0): string =

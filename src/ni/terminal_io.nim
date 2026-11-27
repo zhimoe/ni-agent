@@ -20,6 +20,9 @@ type
     kkPageDown
     kkScrollUp
     kkScrollDown
+    kkMousePress
+    kkMouseDrag
+    kkMouseRelease
     kkMouseOther
     kkWordLeft
     kkWordRight
@@ -50,10 +53,13 @@ type
     kkPaste
     kkChar
 
+  ScreenPoint* = tuple[row, col: int]
+
   KeyEvent* = object
     kind*: KeyKind
     ch*: char
     text*: string
+    mouse*: ScreenPoint
 
 var colorsEnabled = true
 
@@ -188,10 +194,10 @@ proc fullScreenEnabled*(): bool =
   fullScreenActive
 
 proc enterFullScreen*() =
-  ## Enter the alternate screen buffer, hide the cursor, and capture wheel events for in-app scrolling.
+  ## Enter the alternate screen buffer and capture wheel and drag events.
   if fullScreenActive or not supportsFullScreen():
     return
-  stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[?1000h\x1b[?1006h\x1b[?25l")
+  stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[?1002h\x1b[?1006h\x1b[?25l")
   stdout.flushFile()
   fullScreenActive = true
 
@@ -199,7 +205,7 @@ proc exitFullScreen*() =
   ## Leave the alternate screen buffer, release mouse capture, and restore the cursor.
   if not fullScreenActive:
     return
-  stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l")
+  stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?1049l")
   stdout.flushFile()
   fullScreenActive = false
 
@@ -272,7 +278,7 @@ proc disableBracketedPaste*() =
     stdout.write("\x1b[?2004l")
     stdout.flushFile()
 
-# ANSI & OSC 8 styling helpers (scrollback-native, zero mouse hijacking so terminal copy-on-select always works)
+# ANSI & OSC 8 styling helpers
 
 proc ansiWrap(code, text: string): string =
   if not colorsEnabled or text.len == 0: text
@@ -394,6 +400,39 @@ proc stripAnsi*(s: string): string =
     else:
       result.add(s[i])
       inc i
+
+proc selectScreenCells*(line: string, first, past: int, paint = false, cursorMarker = -1): string =
+  ## Copy selected cells as plain text, or paint the selection while keeping the row's existing styles.
+  let selectionStyle = if colorsActive(): "\x1b[22;27;97;44m" else: "\x1b[7m"
+  var styles = ""
+  var i, col = 0
+  var selected = false
+  while i < line.len:
+    let start = i
+    if line[i] == '\x1b':
+      i = skipAnsiSeq(line, i)
+      if paint:
+        let sequence = line[start ..< i]
+        result.add(sequence)
+        if sequence.startsWith("\x1b[") and sequence.endsWith("m"):
+          if sequence in ["\x1b[m", "\x1b[0m"]: styles.setLen(0)
+          else: styles.add(sequence)
+          if selected: result.add(selectionStyle)
+      continue
+
+    var rune: Rune
+    fastRuneAt(line, i, rune, doInc = true)
+    let width = runeDisplayWidth(rune)
+    if width > 0:
+      let inside = col < past and col + width > first
+      if paint and selected != inside:
+        result.add(if inside: selectionStyle else: "\x1b[0m" & styles)
+      selected = inside
+    if paint or (selected and not (col == cursorMarker and rune == Rune(0x258F))):
+      result.add(line[start ..< i])
+    col += width
+  if paint and selected:
+    result.add("\x1b[0m")
 
 proc visibleWidth*(s: string): int =
   ## Compute terminal column width of s ignoring ANSI escape codes and accounting for CJK/Emoji double-width runes.
@@ -667,13 +706,23 @@ proc decodeCsiSequence(paramsStr: string, finalCh: char): KeyEvent =
   of 'M', 'm':
     # SGR mouse reports encode Shift, Meta and Ctrl alongside the button code.
     # Horizontal wheel reports (66/67) must leave the vertical viewport alone.
-    if finalCh == 'M' and paramsStr.len > 1 and paramsStr[0] == '<':
-      let code = (try: parseInt(paramsStr[1 .. ^1].split(';')[0]) except ValueError: -1)
+    if paramsStr.len > 1 and paramsStr[0] == '<':
+      let parts = paramsStr[1 .. ^1].split(';')
       const MouseModifierBits = 4 or 8 or 16
-      case code and not MouseModifierBits
-      of 64: return KeyEvent(kind: kkScrollUp)
-      of 65: return KeyEvent(kind: kkScrollDown)
-      else: discard
+      if parts.len == 3:
+        try:
+          let button = parseInt(parts[0]) and not MouseModifierBits
+          if finalCh == 'M':
+            if button == 64: return KeyEvent(kind: kkScrollUp)
+            if button == 65: return KeyEvent(kind: kkScrollDown)
+          if button == 0 or (button == 32 and finalCh == 'M'):
+            let (col, row) = (parseInt(parts[1]), parseInt(parts[2]))
+            if col > 0 and row > 0:
+              let kind = if finalCh == 'm': kkMouseRelease
+                elif button == 32: kkMouseDrag else: kkMousePress
+              return KeyEvent(kind: kind, mouse: (row - 1, col - 1))
+        except ValueError:
+          discard
     return KeyEvent(kind: kkMouseOther)
   of 'C':
     if paramsStr in ["1;3", "1;5", "3", "5"]:
@@ -738,6 +787,7 @@ var rawModeDepth = 0
 
 when defined(windows):
   var savedConsoleMode: DWORD
+  var consoleLeftDown: bool
 else:
   var savedOrigTerm: Termios
 
@@ -748,7 +798,12 @@ proc setRawInputMode(): bool =
       return false
     # Preserve console Ctrl+C signals so commands can be interrupted while the editor is idle.
     let flags = ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT or ENABLE_MOUSE_INPUT or ENABLE_VIRTUAL_TERMINAL_INPUT
-    setConsoleMode(handle, savedConsoleMode and not DWORD(flags)) != 0
+    var raw = savedConsoleMode and not DWORD(flags)
+    if supportsFullScreen():
+      const EnableExtendedFlags = DWORD(0x0080)
+      raw = (raw or DWORD(ENABLE_MOUSE_INPUT) or EnableExtendedFlags) and not DWORD(ENABLE_QUICK_EDIT_MODE)
+    consoleLeftDown = false
+    setConsoleMode(handle, raw) != 0
   else:
     let fd = getFileHandle(stdin)
     if tcGetAttr(fd, addr savedOrigTerm) != 0:
@@ -793,6 +848,19 @@ proc exitRawTerminalMode*() =
 
 when defined(windows):
   # Console records carry UTF-16 units and virtual keys. Convert both to the byte stream used by the shared decoder.
+  type
+    ConsoleMouseRecord = object
+      eventType, padding: int16
+      position: COORD
+      buttons, controlState, flags: DWORD
+
+    ConsoleInputRecord {.union.} = object
+      key: KEY_EVENT_RECORD
+      mouse: ConsoleMouseRecord
+
+  static:
+    doAssert sizeof(ConsoleMouseRecord) == sizeof(KEY_EVENT_RECORD)
+
   var consoleHighSurrogate: int
   var consoleBytes: string
   var consoleOffset: int
@@ -849,6 +917,24 @@ when defined(windows):
     if unit != 0:
       result = $Rune(unit)
 
+  proc consoleMouseBytes(record: ConsoleMouseRecord): string =
+    # The alternate screen is viewport-sized, so its buffer origin is the visible top left.
+    let coordinates = ";" & $(record.position.x.int + 1) & ";" & $(record.position.y.int + 1)
+    if record.flags == 0x0004: # MOUSE_WHEELED
+      let delta = cast[int16](uint16(cast[uint32](record.buttons) shr 16))
+      if delta == 0: return ""
+      let code = if delta > 0: "64" else: "65"
+      return "\x1b[<" & code & coordinates & "M"
+    if record.flags == 0x0008: return "" # MOUSE_HWHEELED
+
+    let down = (record.buttons and 1) != 0
+    let wasDown = consoleLeftDown
+    consoleLeftDown = down
+    if down != wasDown:
+      return "\x1b[<0" & coordinates & (if down: "M" else: "m")
+    if down and record.flags == 0x0001: # MOUSE_MOVED
+      return "\x1b[<32" & coordinates & "M"
+
   proc readInputByte(timeoutMs: int): int =
     let handle = getStdHandle(STD_INPUT_HANDLE)
     let started = getMonoTime()
@@ -859,17 +945,22 @@ when defined(windows):
       of WAIT_TIMEOUT: return -1
       of WAIT_OBJECT_0: discard
       else: return -2
-      var record: KEY_EVENT_RECORD
+      var record: ConsoleInputRecord
       var count: cint
       if readConsoleInput(handle, addr record, 1, addr count) == 0:
         return -2
-      # Alt+numpad can report its resulting character on the Alt release.
-      if count == 0 or record.eventType != 1 or
-          (record.bKeyDown == 0 and (record.wVirtualKeyCode != 0x12 or record.uChar == 0)):
+      if count == 0: continue
+      if record.key.eventType == 2 and fullScreenEnabled():
+        consoleBytes = consoleMouseBytes(record.mouse)
+        if consoleBytes.len > 0: consoleRepeats = 1
         continue
-      consoleBytes = consoleKeyBytes(record)
+      let key = record.key
+      # Alt+numpad can report its resulting character on the Alt release.
+      if key.eventType != 1 or (key.bKeyDown == 0 and (key.wVirtualKeyCode != 0x12 or key.uChar == 0)):
+        continue
+      consoleBytes = consoleKeyBytes(key)
       if consoleBytes.len > 0:
-        consoleRepeats = max(1, cast[uint16](record.wRepeatCount).int)
+        consoleRepeats = max(1, cast[uint16](key.wRepeatCount).int)
 
     result = ord(consoleBytes[consoleOffset])
     inc consoleOffset
