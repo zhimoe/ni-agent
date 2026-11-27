@@ -165,8 +165,10 @@ def check_console(binary, root):
                                  capture_output=True, env=env, cwd=root, timeout=8)
             assert rpc.returncode == 0, rpc.stderr
             lines = [json.loads(line) for line in rpc.stdout.splitlines()]
-            responses = {line["id"]: line for line in lines if line.get("type") == "response"}
-            assert list(responses) == ["before", "shell", "after"], lines
+            records = [line for line in lines if line.get("type") == "response"]
+            responses = {line["id"]: line for line in records}
+            # State queries can return while the Shell command is still running.
+            assert len(records) == 3 and set(responses) == {"before", "shell", "after"}, lines
             assert all(response.get("success") for response in responses.values()), responses
             assert responses["shell"]["data"]["output"].strip() == "NI_CMD_OK"
         finally:
