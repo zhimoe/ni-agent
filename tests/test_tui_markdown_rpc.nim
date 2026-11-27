@@ -3,6 +3,12 @@
 import std/[json, options, os, osproc, streams, strutils, tables, unittest]
 import ../src/ni/[types, config, trust, provider, tools, skills, mcp, session, agent, terminal_io, keybindings, editor, markdown, viewport]
 
+proc readRpcOutput(stream: Stream): string =
+  ## Windows pipes can return a short read between two JSONL responses.
+  var line = ""
+  while stream.readLine(line):
+    result.add(line & "\n")
+
 suite "TUI Layout, Multi-line Input Editor, and Terminal Markdown Renderer":
   test "Unicode/CJK visibleWidth, ANSI/OSC8 stripping, and ANSI-preserving word wrap":
     let prevColors = colorsActive()
@@ -732,7 +738,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       rpcProc.inputStream.flush()
       rpcProc.inputStream.close()
 
-      let rpcOut = rpcProc.outputStream.readAll()
+      let rpcOut = readRpcOutput(rpcProc.outputStream)
       check rpcProc.waitForExit() == 0
 
       var sawState = false
@@ -802,7 +808,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
         """{"id":"abort","type":"abort"}"""
       ].join("\n") & "\n")
       liveRpc.inputStream.close()
-      let events = liveRpc.outputStream.readAll().strip().splitLines()
+      let events = readRpcOutput(liveRpc.outputStream).strip().splitLines()
       check liveRpc.waitForExit() == 0
 
       var responses = initTable[string, JsonNode]()
@@ -836,7 +842,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       sleep(200)
       bashRpc.inputStream.writeLine("""{"id":"stop-shell","type":"abort_bash"}""")
       bashRpc.inputStream.close()
-      let bashRecords = bashRpc.outputStream.readAll().strip().splitLines()
+      let bashRecords = readRpcOutput(bashRpc.outputStream).strip().splitLines()
       check bashRpc.waitForExit(2000) == 0
       var sawValidDelta, sawCancelled = false
       for line in bashRecords:
@@ -880,7 +886,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
     rpc.inputStream.close()
 
     var responses = initTable[string, JsonNode]()
-    for line in rpc.outputStream.readAll().strip().splitLines():
+    for line in readRpcOutput(rpc.outputStream).strip().splitLines():
       let response = parseJson(line)
       responses[response["id"].getStr()] = response
     check rpc.waitForExit() == 0
@@ -941,7 +947,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       defer: rpc.close()
       rpc.inputStream.writeLine("""{"id":"stats","type":"get_session_stats"}""")
       rpc.inputStream.close()
-      let response = parseJson(rpc.outputStream.readAll().strip())
+      let response = parseJson(readRpcOutput(rpc.outputStream).strip())
       check rpc.waitForExit() == 0
       check response["success"].getBool()
       response["data"]

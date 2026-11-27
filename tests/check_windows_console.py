@@ -155,11 +155,20 @@ def check_console(binary, root):
             assert printed.returncode == 0, printed.stderr
             assert ("ECHO:" + PROMPT).encode() in printed.stdout
             assert server.prompts.get(timeout=8) == PROMPT
-            rpc = subprocess.run(command + ["--mode", "rpc"], input=b'{"type":"bash","command":"echo NI_CMD_OK"}\n',
+            commands = [
+                {"id": "before", "type": "get_state"},
+                {"id": "shell", "type": "bash", "command": "echo NI_CMD_OK"},
+                {"id": "after", "type": "get_state"},
+            ]
+            rpc_input = b"".join((json.dumps(record) + "\n").encode() for record in commands)
+            rpc = subprocess.run(command + ["--mode", "rpc"], input=rpc_input,
                                  capture_output=True, env=env, cwd=root, timeout=8)
             assert rpc.returncode == 0, rpc.stderr
             lines = [json.loads(line) for line in rpc.stdout.splitlines()]
-            assert any(line.get("success") and line["data"]["output"].strip() == "NI_CMD_OK" for line in lines)
+            responses = {line["id"]: line for line in lines if line.get("type") == "response"}
+            assert list(responses) == ["before", "shell", "after"], lines
+            assert all(response.get("success") for response in responses.values()), responses
+            assert responses["shell"]["data"]["output"].strip() == "NI_CMD_OK"
         finally:
             kernel.CloseHandle(keys)
             kernel.CloseHandle(output)
