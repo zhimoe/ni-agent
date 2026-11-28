@@ -22,6 +22,7 @@ type
     sessionId*: string
     modelId*: string
     onOutput*: proc(delta: string) {.closure.}
+    subagentTool*: proc(name: string, args: JsonNode): ToolOutput {.closure.}
 
   ToolExecuteProc* = proc(args: JsonNode, ctx: ToolContext): ToolOutput {.closure.}
 
@@ -86,7 +87,7 @@ proc killProcessTree*(p: Process) =
         discard kill(Pid(-pid), SIGKILL)
         discard kill(Pid(pid), SIGKILL)
 
-proc readAvailableFd(fd: FileHandle): tuple[data: string, eof: bool] =
+proc readAvailableFd*(fd: FileHandle): tuple[data: string, eof: bool] =
   when defined(windows):
     var avail: int32 = 0
     if peekNamedPipeWin(Handle(fd), nil, 0, nil, addr avail, nil) == 0:
@@ -986,7 +987,7 @@ proc execGrepTool(args: JsonNode, ctx: ToolContext): ToolOutput =
   if not dirExists(searchPath) and not fileExists(searchPath):
     return errorOutput("Path not found: " & relDir)
 
-  let rgExe = findExe("rg")
+  let rgExe = if not ctx.security.isNil and ctx.security.workspaceReadsOnly: "" else: findExe("rg")
   if rgExe.len == 0:
     return execGrepPureNim(pattern, searchPath, globPat, (if ignoreCase: 1 else: 0), ctxLines, limit, ctx)
 

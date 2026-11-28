@@ -1087,7 +1087,8 @@ proc newMcpManager*(cfg: ConfigBundle, reg: ToolRegistry, connectNow = true, sec
     reg.activeNames.incl("tool_search")
 
 proc configureRuntimeTools*(cfg: ConfigBundle, overrides: seq[seq[string]],
-                            noTools, noMcp: bool, security: SecurityPolicy = nil):
+                            noTools, noMcp: bool, security: SecurityPolicy = nil,
+                            additionalTools: seq[AgentTool] = @[]):
     tuple[tools: ToolRegistry, mcp: McpManager] =
   result.tools = newToolRegistry(if noTools: @[] else: cfg.settings.defaultTools)
   result.mcp = if noTools or noMcp:
@@ -1095,6 +1096,9 @@ proc configureRuntimeTools*(cfg: ConfigBundle, overrides: seq[seq[string]],
   else:
     newMcpManager(cfg, result.tools, security = security)
   if not noTools:
+    for tool in additionalTools:
+      result.tools.tools[tool.name] = tool
+      result.tools.activeNames.incl(tool.name)
     for entries in overrides:
       result.tools.applyToolOverrides(entries)
 

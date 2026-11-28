@@ -37,6 +37,7 @@ type
     sandboxMode*: SandboxMode
     sandboxTempDir*: string
     sandboxWrap*: CommandSandboxProc
+    workspaceReadsOnly*: bool
 
 proc canonicalKey*(p: string): string =
   ## Normalize a directory or file path for trust comparisons (case-insensitive on Windows).
@@ -93,10 +94,14 @@ proc isPathWithinDir*(baseDir, candidatePath: string): bool =
   let prefix = if baseNorm.endsWith($sep): baseNorm else: baseNorm & $sep
   candNorm.startsWith(prefix)
 
+proc isSensitivePath*(policy: SecurityPolicy, targetPath: string): tuple[sensitive: bool, reason: string]
+
 proc checkFileRead*(policy: SecurityPolicy, path: string): string =
-  if not policy.isNil and policy.sandboxMode != sandboxOff:
+  if not policy.isNil and (policy.sandboxMode != sandboxOff or policy.workspaceReadsOnly):
     if not isPathWithinDir(policy.cwd, path) or isPathWithinDir(policy.agentDir, path):
       return "Sandbox only allows file tools to access the workspace: " & path
+    if policy.workspaceReadsOnly and policy.isSensitivePath(path).sensitive:
+      return "Subagents cannot read sensitive workspace files: " & path
   ""
 
 proc processEnvironment*(policy: SecurityPolicy): StringTableRef =
@@ -288,7 +293,7 @@ proc checkFileMutation*(policy: SecurityPolicy, targetPath: string, isEdit: bool
   ## Return "" when writing/editing targetPath is allowed, or an error description when denied.
   if policy.isNil:
     return ""
-  if policy.sandboxMode == sandboxReadOnly:
+  if policy.sandboxMode == sandboxReadOnly or policy.workspaceReadsOnly:
     return "Read-only sandbox prohibits editing workspace files"
   let sandboxDenial = policy.checkFileRead(targetPath)
   if sandboxDenial.len > 0:

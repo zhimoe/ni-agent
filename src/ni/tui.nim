@@ -2,7 +2,7 @@
 
 import std/[algorithm, json, monotimes, options, os, sequtils, sets, strutils, tables, times]
 from std/unicode import toLower
-import ./[types, config, trust, provider, tools, skills, mcp, session, agent, brand, terminal_io, keybindings, editor, markdown, viewport, utf8, release_info, herdr, workspace_diff]
+import ./[types, config, trust, provider, tools, skills, mcp, session, agent, brand, terminal_io, keybindings, editor, markdown, viewport, utf8, release_info, herdr, workspace_diff, subagents]
 
 type
   DockViewport* = ref object
@@ -544,6 +544,11 @@ proc restoreTranscript(vp: DockViewport, banner: openArray[string] = []) =
       elif msg.diff.len > 0:
         discard vp.transcript.beginSegment(segTool, msg.toolName, entry.id)
         vp.transcript.addLines(formatColoredDiffLines(stripAnsi(msg.diff)))
+      else:
+        let states = subagentResultSummary(msg.toolName, ToolOutput(content: msg.resultBlocks))
+        if states.len > 0:
+          discard vp.transcript.beginSegment(segTool, msg.toolName, entry.id)
+          for state in states: vp.transcript.addLines([styleDim("    " & state)])
     of mrSystem:
       discard
   if vp.fullScreen: vp.redrawDock()
@@ -689,6 +694,8 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
           stdout.writeLine("  " & styleRed("✗ " & collectText(ev.toolOutput.content).splitLines()[0]))
         elif ev.toolOutput.diff.len > 0:
           renderColoredDiff(ev.toolOutput.diff)
+        for line in subagentResultSummary(ev.endToolName, ev.toolOutput):
+          stdout.writeLine(styleDim("    " & line))
       of aekTurnEnd:
         if inText: mdStream.finishStream(); inText = false
       of aekRunEnd:
@@ -810,6 +817,8 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
         if ev.toolOutput.diff.len > 0:
           for dl in formatColoredDiffLines(ev.toolOutput.diff):
             commit.add("  " & dl)
+        for line in subagentResultSummary(ev.endToolName, ev.toolOutput):
+          commit.add(styleDim("    " & line))
         if ev.toolOutput.activatedTools.len > 0:
           commit.add("    " & styleGreen("+ Activated tools: ") & ev.toolOutput.activatedTools.join(", "))
       if commit.len > 0:
@@ -1339,7 +1348,8 @@ proc reloadRuntimeResources(rt: AgentRuntime, vp: DockViewport) =
   rt.providerRegistry = newProviderRegistry(newCfg, rt.providerRegistry.transport)
   if not rt.mcpManager.isNil:
     rt.mcpManager.closeAll()
-  let (newToolReg, newMcp) = configureRuntimeTools(newCfg, rt.toolOverrides, rt.noTools, rt.noMcp, rt.security)
+  let extraTools = if rt.subagentsEnabled: subagentTools() else: @[]
+  let (newToolReg, newMcp) = configureRuntimeTools(newCfg, rt.toolOverrides, rt.noTools, rt.noMcp, rt.security, extraTools)
   let (newSkills, newTpls, resourceDiags) = discoverRuntimeResources(newCfg, rt.configOverrides)
   rt.toolRegistry = newToolReg
   rt.mcpManager = newMcp

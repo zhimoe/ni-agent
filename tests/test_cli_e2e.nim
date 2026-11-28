@@ -4,6 +4,17 @@ import std/[json, os, osproc, streams, strutils, unittest]
 import ../src/ni/[release_info, session, types]
 
 suite "End-to-End CLI Binary + Live Local HTTP SSE Provider + Live Streamable HTTP MCP":
+  test "Subagents run in parallel with read-only tools and stop when the parent ends":
+    let pythonExe = findExe("python3")
+    let niBin = getCurrentDir() / addFileExt("ni", ExeExt)
+    if pythonExe.len == 0 or not fileExists(niBin):
+      echo "  (Skipping subagent E2E test: requires python3 and compiled ./ni)"
+    else:
+      let fixture = getCurrentDir() / "tests" / "check_subagents.py"
+      let (output, status) = execCmdEx(quoteShellCommand([pythonExe, fixture, niBin]))
+      if status != 0: echo output
+      check status == 0
+
   test "HTTP MCP OAuth discovery, PKCE login, credential refresh and connection management":
     let pythonExe = findExe("python3")
     let niBin = getCurrentDir() / addFileExt("ni", ExeExt)

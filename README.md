@@ -76,6 +76,14 @@ Use `--tools read,grep,find,ls` to limit which tools the model can execute or `-
 
 The process sandbox uses Seatbelt on macOS and bubblewrap on Linux. Requests for a restricted mode fail when its platform backend is unavailable. The default `off` mode uses the existing tool approval policy.
 
+### Subagents
+
+Start Ni with `./ni --subagents` and ask it to investigate independent parts of the workspace in parallel. For example, ask it to have one subagent trace configuration loading and another review the tests, then combine their findings.
+
+`spawn_agent` starts a worker with a self-contained task. `list_agents` shows status, `wait_agent` returns results and reported token usage, and `cancel_agent` stops a worker. These tools work in the TUI, print, JSONL, and RPC modes. An explicit `--tools` list must include the subagent tools you want to use. `--no-tools` disables them.
+
+Each worker uses the parent's active model and a separate in-memory session. Workers can use the parent-enabled subset of `read`, `grep`, `find`, and `ls` within the workspace. Worker `grep` uses literal matching. Ni keeps up to four workers active and accepts up to twelve tasks per parent run. A worker can run for up to two minutes and take up to eight agent turns, further limited by the parent's `--max-turns`. Collect results before the parent run ends, since Ni stops any workers still running at that point.
+
 ### MCP authentication and management
 
 Use `ni mcp login <name>` for HTTP OAuth, `logout` to remove local OAuth credentials, and `reconnect` to test a fresh connection. `mcp enable` and `mcp disable` accept `--tool <name>` for individual tools. Inside the TUI use `/mcp login <name>`, `/mcp logout <name>` or `/mcp enable <name> [tool]` and `/mcp disable <name> [tool]`.

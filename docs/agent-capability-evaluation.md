@@ -20,7 +20,7 @@ Ni 已可加载用户 Skills，也可启动 stdio MCP 服务。已在本机用 `
 
 Codex CLI 为子 Agent 提供独立线程、并发上限和状态管理，子 Agent 继承父任务的沙箱与审批配置。公开实现把启动、等待、发送消息和中断拆成独立处理器，启动可选择继承的上下文范围。 [Codex 子 Agent 文档](https://learn.chatgpt.com/docs/agent-configuration/subagents?surface=cli) · [Codex 启动处理器](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs)
 
-Ni 首版可让父进程通过现有 JSONL RPC 启动多个 Ni 子进程。每个子 Agent 使用独立会话、显式任务说明和工具名单。模型工具集合由父任务权限与子任务配置取交集。先支持一次派发、查询状态、等待和取消，设置并发、轮数及运行时间上限，并把每个子任务的输出、退出状态和 token 用量归回父任务。首版关闭子任务递归，只开放读取和搜索工具。 [Ni RPC](../src/ni/rpc.nim) · [Ni 权限策略](../src/ni/trust.nim)
+Ni 首版使用内部 JSONL 管道启动多个 Ni 子进程，对外沿用现有工具和 RPC 事件。每个子 Agent 使用独立的内存会话、显式任务说明和继承的只读工具名单。父任务可以派发、查询、等待和取消，读取各子任务的输出、状态与供应商报告的 token 用量。 [子 Agent 使用说明](../README.md#subagents) · [子进程管理](../src/ni/subagents.nim) · [Ni 权限策略](../src/ni/trust.nim)
 
 验收用两个并行读取任务检查会话相互独立、父任务取消能回收子进程、子任务失败能被识别、运行预算生效。后续再支持续跑和并行改代码，为各写任务建立隔离工作树并由父任务处理合并。
 

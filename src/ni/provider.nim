@@ -45,11 +45,17 @@ type
     abort: AbortFlag
   ): AgentMessage {.closure.}
 
+  ProviderAccess* = object
+    apiKey*: string
+    headers*: Table[string, string]
+    error*: string
+
   ProviderRegistry* = ref object
     providers*: OrderedTable[string, ProviderConfig]
     adapters*: Table[string, ApiAdapterProc]
     transport*: HttpStreamTransport
     onIdleTick*: proc() {.closure.}
+    resolvedAccess*: Option[ProviderAccess]
 
   PartialToolCall = object
     id: string
@@ -2233,6 +2239,24 @@ proc resolveModel*(
 
   (reg.providers["deepseek"].models[0], thinkingOpt)
 
+proc prepareProviderAccess*(reg: ProviderRegistry, cfg: ConfigBundle, model: ModelConfig,
+                            cliApiKey = ""): ProviderAccess =
+  ## Resolve credentials before crossing a process boundary or making a provider request.
+  if reg.resolvedAccess.isSome:
+    return reg.resolvedAccess.get
+  if cliApiKey.strip().len == 0:
+    let refreshError = refreshOAuthIfNeeded(cfg, model.provider)
+    if refreshError.isSome:
+      return ProviderAccess(error: refreshError.get)
+  result.headers = reg.resolveHeaders(cfg, model)
+  let key = reg.resolveProviderApiKey(cfg, model.provider, cliApiKey)
+  if key.isSome:
+    result.apiKey = key.get
+  elif not (result.headers.hasKey("Authorization") or result.headers.hasKey("authorization")):
+    result.error = "No API key configured for provider '" & model.provider &
+      "'. Set $" & model.provider.toUpperAscii() & "_API_KEY, run `ni auth login " & model.provider &
+      "`, or configure ~/.pi/agent/auth.json or models.json."
+
 proc streamCompletion*(
   reg: ProviderRegistry,
   cfg: ConfigBundle,
@@ -2246,10 +2270,10 @@ proc streamCompletion*(
   abort: AbortFlag = nil
 ): AgentMessage =
   ## Dispatch a streaming model turn with automatic transient-error retries.
-  let refreshErr = if cliApiKey.strip().len == 0: refreshOAuthIfNeeded(cfg, model.provider) else: none(string)
-  if refreshErr.isSome:
+  let access = reg.prepareProviderAccess(cfg, model, cliApiKey)
+  if access.error.len > 0:
     if not onEvent.isNil:
-      onEvent(StreamEvent(kind: sekError, errorMsg: refreshErr.get))
+      onEvent(StreamEvent(kind: sekError, errorMsg: access.error))
     return AgentMessage(
       role: mrAssistant,
       timestampMs: nowUnixMs(),
@@ -2259,35 +2283,15 @@ proc streamCompletion*(
       model: model.id,
       thinkingLevel: thinkingLevel,
       stopReason: srError,
-      errorMessage: refreshErr.get
-    )
-  let headers = reg.resolveHeaders(cfg, model)
-  let keyOpt = reg.resolveProviderApiKey(cfg, model.provider, cliApiKey)
-  let hasAuthHeader = headers.hasKey("Authorization") or headers.hasKey("authorization")
-  if keyOpt.isNone and not hasAuthHeader:
-    let errMsg = "No API key configured for provider '" & model.provider &
-      "'. Set $" & model.provider.toUpperAscii() & "_API_KEY, run `ni auth login " & model.provider &
-      "`, or configure ~/.pi/agent/auth.json or models.json."
-    if not onEvent.isNil:
-      onEvent(StreamEvent(kind: sekError, errorMsg: errMsg))
-    return AgentMessage(
-      role: mrAssistant,
-      timestampMs: nowUnixMs(),
-      assistantBlocks: @[],
-      api: model.api,
-      provider: model.provider,
-      model: model.id,
-      thinkingLevel: thinkingLevel,
-      stopReason: srError,
-      errorMessage: errMsg
+      errorMessage: access.error
     )
 
   let apiName = if model.api.len > 0: model.api else: "openai-completions"
   let adapter = reg.adapters.getOrDefault(apiName, openAICompletionsAdapter)
   let req = ProviderRequest(
     model: model,
-    apiKey: if keyOpt.isSome: keyOpt.get else: "",
-    headers: headers,
+    apiKey: access.apiKey,
+    headers: access.headers,
     systemPrompt: systemPrompt,
     messages: messages,
     tools: tools,

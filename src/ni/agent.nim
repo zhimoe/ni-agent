@@ -1,7 +1,7 @@
 # Core multi-turn Agent runtime: @file expansion, context compaction, streaming LLM turns, and tool execution loop.
 
-import std/[base64, json, monotimes, options, os, strutils, tables, times]
-import ./[types, config, trust, provider, tools, skills, mcp, session, prompt, utf8]
+import std/[base64, json, monotimes, options, os, sets, strutils, tables, times]
+import ./[types, config, trust, provider, tools, skills, mcp, session, prompt, subagents, utf8]
 
 const MaxAgentTurnsPerRun* = 64
 
@@ -90,6 +90,7 @@ type
     toolOverrides*: seq[seq[string]]
     noTools*: bool
     noMcp*: bool
+    subagentsEnabled*: bool
     skills*: seq[Skill]
     promptTemplates*: seq[PromptTemplate]
     security*: SecurityPolicy
@@ -491,24 +492,55 @@ proc appendQueuedPrompts(rt: AgentRuntime, queue: var seq[QueuedPrompt], mode: Q
   rt.emitQueueUpdate(onEvent)
   true
 
+proc prepareSubagent(rt: AgentRuntime): SubagentRequest =
+  result.model = rt.currentModel
+  result.access = rt.providerRegistry.prepareProviderAccess(rt.cfg, rt.currentModel, rt.cliApiKey)
+  result.model.headers.clear()
+  result.model.samplingParams = newJObject()
+  let sampling = rt.currentModel.samplingParams
+  if not sampling.isNil and sampling.kind == JObject:
+    for key in ["temperature", "top_p", "top_k", "seed", "frequency_penalty", "presence_penalty"]:
+      if sampling.hasKey(key): result.model.samplingParams[key] = sampling[key]
+  let modelLimit = result.model.maxTokens
+  result.model.maxTokens = if modelLimit > 0: min(modelLimit, SubagentMaxOutputTokens) else: SubagentMaxOutputTokens
+  result.thinking = rt.thinkingLevel
+  result.agentDir = rt.cfg.agentDir
+  result.security = rt.security.mode
+  result.maxTurns = min(rt.maxTurnsPerRun, SubagentMaxTurns)
+  result.proxy = rt.cfg.settings.httpProxy
+  result.httpTimeoutMs = rt.cfg.settings.httpIdleTimeoutMs
+  result.retry = rt.cfg.settings.retry
+  for name in SubagentReadTools:
+    if name in rt.toolRegistry.activeNames: result.tools.add(name)
+
 proc runPrompt*(
   rt: AgentRuntime,
   rawPrompt: string,
   explicitFiles: openArray[string] = [],
   onEvent: AgentEventCallback = nil,
   abort: AbortFlag = nil,
-  extraImages: openArray[ContentBlock] = []
+  extraImages: openArray[ContentBlock] = [],
+  literalPrompt = false
 ): AgentMessage =
   ## Submit a user prompt and run the agent tool-calling loop to completion.
   let turnAbort = if abort.isNil: newAbortFlag() else: abort
   let previousIdle = turnAbort.onIdle
-  if previousIdle.isNil:
-    turnAbort.onIdle = rt.providerRegistry.onIdleTick
+  let idle = if previousIdle.isNil: rt.providerRegistry.onIdleTick else: previousIdle
+  let pool = if rt.subagentsEnabled: newSubagentPool(rt.cfg.cwd) else: nil
+  if pool.isNil:
+    turnAbort.onIdle = idle
+  else:
+    turnAbort.onIdle = proc() =
+      if not idle.isNil: idle()
+      pool.poll()
+  defer:
+    if not pool.isNil: pool.close()
   defer: turnAbort.onIdle = previousIdle
   let firstNewEntry = rt.session.entries.len
   if not onEvent.isNil:
     onEvent(AgentEvent(kind: aekRunStart))
-  let userMsg = rt.buildUserPromptMessage(rawPrompt, explicitFiles, extraImages)
+  let userMsg = if literalPrompt: newUserMessage(rawPrompt)
+    else: rt.buildUserPromptMessage(rawPrompt, explicitFiles, extraImages)
   rt.appendObservedMessage(userMsg, onEvent)
 
   var turns = 0
@@ -600,6 +632,12 @@ proc runPrompt*(
       sessionId: rt.session.id,
       modelId: rt.currentModel.provider & "/" & rt.currentModel.id
     )
+    if not pool.isNil:
+      toolCtx.subagentTool = proc(name: string, args: JsonNode): ToolOutput =
+        if name == "spawn_agent":
+          pool.spawn(args{"task"}.getStr().strip(), proc(): SubagentRequest = rt.prepareSubagent())
+        else:
+          pool.manage(name, args, turnAbort)
 
     var toolResults: seq[AgentMessage]
     for tc in toolCalls:
@@ -642,6 +680,7 @@ proc runPrompt*(
 
   if turnAbort.aborted:
     lastAssistant.stopReason = srAborted
+  if not pool.isNil: pool.close()
   if not onEvent.isNil:
     var messages: seq[AgentMessage]
     for i in firstNewEntry ..< rt.session.entries.len:

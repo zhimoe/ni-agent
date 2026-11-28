@@ -1,7 +1,7 @@
 # CLI entry point for `ni` coding agent (`ni`, `ni mcp ...`, `ni auth ...`).
 
 import std/[json, options, os, strutils, tables]
-import ./ni/[types, config, trust, provider, tools, mcp, session, agent, terminal_io, tui, rpc, sandbox, utf8, release_info]
+import ./ni/[types, config, trust, provider, tools, mcp, session, agent, terminal_io, tui, rpc, sandbox, subagents, subagent_worker, utf8, release_info]
 
 type CliArgumentError = object of ValueError
 
@@ -47,6 +47,7 @@ Options:
   -n, --name <title>               Set session display title
   -t, --tools <list>               Comma-separated tool allowlist or `+tool,-tool` deltas
       --no-tools                   Disable all tools
+      --subagents                  Enable parallel read-only subagents for this run
       --no-mcp                     Skip connecting MCP servers for this run
       --skill <path>               Load extra skill file or directory (repeatable)
       --no-skills                  Disable automatic skill discovery
@@ -382,13 +383,15 @@ proc runMcpSubcommand(args: seq[string]): int =
 # Main CLI entry
 
 proc main(): int =
+  let rawArgs = commandLineParams()
+  if rawArgs == @[SubagentWorkerArg]:
+    return runSubagentWorker()
   initTerminal()
   defer:
     when defined(windows):
       stdout.flushFile()
       stderr.flushFile()
     restoreTerminal()
-  let rawArgs = commandLineParams()
   if rawArgs.len > 0:
     case rawArgs[0]
     of "mcp":
@@ -419,6 +422,7 @@ proc main(): int =
   var toolsSpec: seq[string] = @[]
   var noTools = false
   var noMcp = false
+  var subagentsEnabled = false
   var extraSkills: seq[string] = @[]
   var noSkills = false
   var extraPrompts: seq[string] = @[]
@@ -509,6 +513,8 @@ proc main(): int =
       noTools = true
     of "--no-mcp":
       noMcp = true
+    of "--subagents":
+      subagentsEnabled = true
     of "--skill":
       extraSkills.add(optionValue(rawArgs, i))
     of "-ns", "--no-skills":
@@ -656,7 +662,8 @@ proc main(): int =
     stderr.writeLine("Warning: " & diagnostic)
 
   let toolOverrides = if toolsSpec.len > 0: @[toolsSpec] else: @[]
-  let (toolReg, mcpMgr) = configureRuntimeTools(cfg, toolOverrides, noTools, noMcp, secPolicy)
+  let extraTools = if subagentsEnabled: subagentTools() else: @[]
+  let (toolReg, mcpMgr) = configureRuntimeTools(cfg, toolOverrides, noTools, noMcp, secPolicy, extraTools)
   defer: mcpMgr.closeAll()
   let (skillList, promptTplList, _) = discoverRuntimeResources(cfg, configOverrides)
 
@@ -693,6 +700,7 @@ proc main(): int =
   rt.toolOverrides = toolOverrides
   rt.noTools = noTools
   rt.noMcp = noMcp
+  rt.subagentsEnabled = subagentsEnabled and not noTools
   rt.sessionsRoot = sessionsRoot
   defer: rt.session.close()
 
