@@ -757,7 +757,7 @@ proc runUserShell*(command, cwd: string, settings: NiSettings, policy: SecurityP
   runProcessCapture(wrappedExe, wrappedArgs, cwd, policy.processEnvironment(), timeoutSec, abort, onOutput = onOutput)
 
 proc runInteractiveUserShell*(command, cwd: string, settings: NiSettings, policy: SecurityPolicy,
-                              abort: AbortFlag):
+                              abort: AbortFlag, onOutput: proc(delta: string) {.closure.} = nil):
     tuple[output: string, exitCode: int, timedOut: bool, aborted: bool, wallSec: float] =
   ## Load user aliases for commands typed at the prompt. Automation and sandboxed commands keep their existing shell.
   when not defined(windows):
@@ -776,13 +776,32 @@ proc runInteractiveUserShell*(command, cwd: string, settings: NiSettings, policy
         # The captured child is in its own process group, behind the TUI.
         let args = if shellName == "zsh": @["-o", "NO_MONITOR", "-ic", script]
           else: @["+m", "-ic", script]
-        result = runProcessCapture(shell, args, cwd, policy.processEnvironment(), 0, abort)
         let boundary = marker & "\n"
+        var startupTail = ""
+        var started = false
+        proc forwardCommandOutput(delta: string) =
+          if started:
+            onOutput(delta)
+            return
+          startupTail.add(delta)
+          let index = startupTail.find(boundary)
+          if index >= 0:
+            started = true
+            let first = index + boundary.len
+            if first < startupTail.len:
+              onOutput(startupTail[first .. ^1])
+            startupTail.setLen(0)
+          elif startupTail.len >= boundary.len:
+            startupTail = startupTail[startupTail.len - boundary.len + 1 .. ^1]
+        let forward = if onOutput.isNil: nil else: forwardCommandOutput
+        result = runProcessCapture(shell, args, cwd, policy.processEnvironment(), 0, abort, onOutput = forward)
         let start = result.output.find(boundary)
         if start >= 0:
           result.output = result.output[start + boundary.len .. ^1]
+        elif not onOutput.isNil and result.output.len > 0:
+          onOutput(result.output)
         return
-  runUserShell(command, cwd, settings, policy, abort)
+  runUserShell(command, cwd, settings, policy, abort, onOutput = onOutput)
 
 # 5. `ls` tool
 

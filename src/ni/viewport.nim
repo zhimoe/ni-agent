@@ -14,6 +14,7 @@ type
   Segment* = object
     kind*: SegmentKind
     title*: string
+    entryId*: string
 
   ScreenSelection* = object
     anchor*, head*: ScreenPoint
@@ -29,10 +30,10 @@ type
     scrollUp*: int
     visibleRows: int
 
-proc beginSegment*(t: Transcript, kind: SegmentKind, title = ""): int =
+proc beginSegment*(t: Transcript, kind: SegmentKind, title = "", entryId = ""): int =
   ## Open a new logical message block; committed rows and the live tail attach to it.
   result = t.segments.len
-  t.segments.add(Segment(kind: kind, title: title))
+  t.segments.add(Segment(kind: kind, title: title, entryId: entryId))
   t.segStart.add(t.lines.len)
   t.tailSeg = result
 
@@ -103,6 +104,11 @@ proc scrollToBottom*(t: Transcript) =
 
 proc scrollToTop*(t: Transcript) =
   t.scrollUp = t.maxScrollUp()
+
+proc revealLine*(t: Transcript, row: int) =
+  ## Place a transcript row near the center of the viewport.
+  let targetEnd = row + max(1, t.visibleRows div 2) + 1
+  t.scrollUp = clamp(t.totalLines() - targetEnd, 0, t.maxScrollUp())
 
 proc renderStickyHeader*(t: Transcript, segIdx, above, width: int): string =
   ## Render the pinned one-line header of the message that owns the topmost visible row.

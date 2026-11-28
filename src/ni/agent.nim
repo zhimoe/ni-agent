@@ -56,6 +56,7 @@ type
       compactionUsage*: Usage
     of aekAssistantEnd, aekTurnEnd:
       assistantMessage*: AgentMessage
+      assistantEntryId*: string
       turnToolResults*: seq[AgentMessage]
     of aekQueueUpdate:
       queuedSteering*, queuedFollowUps*: seq[string]
@@ -99,6 +100,7 @@ type
     cliApiKey*: string
     cliAppendPrompts*: seq[string]
     askQuestion*: AskQuestionCallback
+    maxTurnsPerRun*: Positive
     steeringQueue*: seq[QueuedPrompt]
     followUpQueue*: seq[QueuedPrompt]
     steeringMode*: QueueMode
@@ -425,7 +427,8 @@ proc newAgentRuntime*(
   askQuestion: AskQuestionCallback = nil,
   promptTemplates: seq[PromptTemplate] = @[],
   keepModel = false,
-  keepThinking = false
+  keepThinking = false,
+  maxTurnsPerRun: Positive = MaxAgentTurnsPerRun
 ): AgentRuntime =
   ## Wire together all subsystems into a ready-to-run AgentRuntime.
   result = AgentRuntime(
@@ -443,6 +446,7 @@ proc newAgentRuntime*(
     cliApiKey: cliApiKey,
     cliAppendPrompts: cliAppendPrompts,
     askQuestion: askQuestion,
+    maxTurnsPerRun: maxTurnsPerRun,
     steeringQueue: @[],
     followUpQueue: @[],
     lastAssistantText: "",
@@ -514,7 +518,7 @@ proc runPrompt*(
     if turnAbort.aborted:
       lastAssistant.stopReason = srAborted
       break
-    if turns == MaxAgentTurnsPerRun:
+    if turns >= rt.maxTurnsPerRun:
       lastAssistant.stopReason = srTurnLimit
       break
 
@@ -561,11 +565,12 @@ proc runPrompt*(
       rt.lastAssistantText = txt
 
     # Persist assistant turn unless completely empty error
-    if assistantMsg.assistantBlocks.len > 0 or assistantMsg.stopReason == srError:
-      discard rt.session.appendMessage(assistantMsg)
+    let assistantEntryId = if assistantMsg.assistantBlocks.len > 0 or assistantMsg.stopReason == srError:
+        rt.session.appendMessage(assistantMsg)
+      else: ""
 
     if not onEvent.isNil:
-      onEvent(AgentEvent(kind: aekAssistantEnd, assistantMessage: assistantMsg))
+      onEvent(AgentEvent(kind: aekAssistantEnd, assistantMessage: assistantMsg, assistantEntryId: assistantEntryId))
 
     if assistantMsg.stopReason in {srError, srAborted, srLength}:
       if not onEvent.isNil:
@@ -581,7 +586,7 @@ proc runPrompt*(
         break
       if rt.steeringQueue.len == 0 and rt.followUpQueue.len == 0:
         break
-      if turns < MaxAgentTurnsPerRun:
+      if turns < rt.maxTurnsPerRun:
         discard rt.appendQueuedPrompts(rt.steeringQueue, rt.steeringMode, onEvent) or
           rt.appendQueuedPrompts(rt.followUpQueue, rt.followUpMode, onEvent)
       continue
@@ -632,7 +637,7 @@ proc runPrompt*(
 
     if not onEvent.isNil:
       onEvent(AgentEvent(kind: aekTurnEnd, assistantMessage: assistantMsg, turnToolResults: toolResults))
-    if not turnAbort.aborted and turns < MaxAgentTurnsPerRun:
+    if not turnAbort.aborted and turns < rt.maxTurnsPerRun:
       discard rt.appendQueuedPrompts(rt.steeringQueue, rt.steeringMode, onEvent)
 
   if turnAbort.aborted:

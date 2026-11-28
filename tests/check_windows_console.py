@@ -171,17 +171,21 @@ def check_console(binary, root):
         try:
             require(kernel.SetConsoleCP(437) and kernel.SetConsoleOutputCP(437))
             original_modes = (mode(keys), mode(output))
-            for term, label in [(None, "Ask anything"), ("dumb", "ni> ")]:
+            for term, no_alt, label in [(None, False, "Ask anything"), ("dumb", False, "ni> "),
+                                       (None, True, "Ask anything")]:
                 if term:
                     env["TERM"] = term
-                with subprocess.Popen(command, env=env, cwd=root) as child:
+                else:
+                    env.pop("TERM", None)
+                args = command + (["--no-alt-screen"] if no_alt else [])
+                with subprocess.Popen(args, env=env, cwd=root) as child:
                     try:
                         wait_for(label, child)
                         send_keys(keys, PROMPT + "\r")
                         assert server.prompts.get(timeout=8) == PROMPT
                         wait_for("ECHO:", child)
                         wait_for(label, child)
-                        if term is None:
+                        if term is None and not no_alt:
                             send_keys(keys, "!echo NI_TUI_SHELL_OK\r")
                             wait_for("  NI_TUI_SHELL_OK", child)
                             wait_for(label, child)
@@ -190,6 +194,12 @@ def check_console(binary, root):
                             wait_for(phrase, child)
                             check_mouse_selection(keys, phrase, child)
                             send_keys(keys, "\b" * len(phrase))
+                        elif no_alt:
+                            send_keys(keys, "/session\r")
+                            wait_for("Session ID", child)
+                            send_keys(keys, "\x12/session")
+                            wait_for("History search", child)
+                            send_keys(keys, "\x07")
                         send_keys(keys, "/quit\r")
                         assert child.wait(timeout=8) == 0
                     finally:
@@ -197,7 +207,7 @@ def check_console(binary, root):
                             child.kill()
                 assert (mode(keys), mode(output)) == original_modes
                 assert kernel.GetConsoleCP() == kernel.GetConsoleOutputCP() == 437
-            env.pop("TERM")
+            env.pop("TERM", None)
             with open(os.devnull, "rb") as nul:
                 result = subprocess.run(command, stdin=nul, env=env, cwd=root, timeout=8)
                 assert result.returncode == 1, "NUL was treated as an interactive console"

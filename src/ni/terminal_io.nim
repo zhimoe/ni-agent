@@ -45,6 +45,7 @@ type
     kkCtrlN
     kkCtrlP
     kkCtrlQ
+    kkCtrlR
     kkCtrlS
     kkCtrlU
     kkCtrlW
@@ -753,6 +754,8 @@ proc decodeCsiSequence(paramsStr: string, finalCh: char): KeyEvent =
       return KeyEvent(kind: kkShiftTab)
     if keyCode == 27:
       return KeyEvent(kind: kkEscape)
+    if keyCode in [ord('r'), ord('R')] and mods == 5:
+      return KeyEvent(kind: kkCtrlR)
     if keyCode == 127:
       if mods in [3, 5]:
         return KeyEvent(kind: kkCtrlW)
@@ -799,7 +802,7 @@ proc setRawInputMode(): bool =
     # Preserve console Ctrl+C signals so commands can be interrupted while the editor is idle.
     let flags = ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT or ENABLE_MOUSE_INPUT or ENABLE_VIRTUAL_TERMINAL_INPUT
     var raw = savedConsoleMode and not DWORD(flags)
-    if supportsFullScreen():
+    if fullScreenEnabled():
       const EnableExtendedFlags = DWORD(0x0080)
       raw = (raw or DWORD(ENABLE_MOUSE_INPUT) or EnableExtendedFlags) and not DWORD(ENABLE_QUICK_EDIT_MODE)
     consoleLeftDown = false
@@ -1020,6 +1023,7 @@ proc decodeInputKey(first: int): KeyEvent =
   of 14: return KeyEvent(kind: kkCtrlN)
   of 16: return KeyEvent(kind: kkCtrlP)
   of 17: return KeyEvent(kind: kkCtrlQ)
+  of 18: return KeyEvent(kind: kkCtrlR)
   of 19: return KeyEvent(kind: kkCtrlS)
   of 21: return KeyEvent(kind: kkCtrlU)
   of 23: return KeyEvent(kind: kkCtrlW)
@@ -1091,28 +1095,47 @@ proc clearRenderedLines*(lineCount: int) =
 
 # Interactive `ask_question` & selector TUI widget
 
-proc selectSearchableOption*(title: string, options: openArray[QuestionOption]): int =
+proc searchTerms*(query: string): seq[string] =
+  strutils.splitWhitespace(unicode.toLower(query))
+
+proc searchExcerpt*(text: string, terms: openArray[string], width: int): string =
+  let plain = strutils.splitWhitespace(stripAnsi(text)).join(" ")
+  let folded = unicode.toLower(plain)
+  var match = folded.find(terms.join(" "))
+  if match < 0:
+    for term in terms:
+      match = max(match, folded.find(term))
+  if match <= 0: return truncateVisible(plain, width)
+  let firstRune = max(0, runeLen(folded[0 ..< match]) - width div 6)
+  let first = runeOffset(plain, firstRune)
+  let leading = if first > 0: "…" else: ""
+  truncateVisible(leading & plain[first .. ^1], width)
+
+proc selectSearchableOption*(title: string, options: openArray[QuestionOption], initialQuery = "",
+                             selectedQuery: ptr string = nil): int =
   ## Return the selected original index, or -1 on cancellation.
   if options.len == 0: return -1
-  var query = ""
+  var searchable: seq[string]
+  for option in options:
+    searchable.add(unicode.toLower(option.label & " " & option.description))
+  var query = initialQuery
   var cursor = 0
   var rendered = 0
   while true:
     let (cols, rows) = terminalSize()
     let visible = max(1, (rows - 5) div 2)
-    let terms = strutils.splitWhitespace(query.toLower())
+    let terms = searchTerms(query)
     var matches: seq[int]
-    for index, option in options:
-      let searchable = (option.label & " " & option.description).toLower()
+    for index, text in searchable:
       var matched = true
       for term in terms:
-        if term notin searchable:
+        if term notin text:
           matched = false
           break
       if matched: matches.add(index)
     cursor = clamp(cursor, 0, max(0, matches.high))
     let first = clamp(cursor - visible + 1, 0, max(0, matches.len - visible))
-    var lines = @[styleBold(title), "  Filter: " & truncateVisible(query, max(1, cols - 12)),
+    var lines = @[styleBold(title), "  Filter: " & fitScreenRow(stripAnsi(query), max(1, cols - 12)),
       styleDim("  ↑/↓ move · PgUp/PgDn page · Enter select · Esc cancel")]
     if matches.len == 0: lines.add(styleDim("  No matching entries"))
     for position in first ..< min(matches.len, first + visible):
@@ -1120,7 +1143,10 @@ proc selectSearchableOption*(title: string, options: openArray[QuestionOption]):
       let pointer = if position == cursor: styleCyan("❯ ") else: "  "
       lines.add("  " & pointer & truncateVisible(option.label, max(1, cols - 5)))
       if option.description.len > 0:
-        lines.add("      " & styleDim(truncateVisible(option.description, max(1, cols - 7))))
+        let width = max(1, cols - 7)
+        let preview = if selectedQuery.isNil: truncateVisible(option.description, width)
+          else: searchExcerpt(option.description, terms, width)
+        lines.add("      " & styleDim(fitScreenRow(preview, width)))
     beginSyncOutput()
     clearRenderedLines(rendered)
     for line in lines: stdout.writeLine(line)
@@ -1137,12 +1163,16 @@ proc selectSearchableOption*(title: string, options: openArray[QuestionOption]):
     of kkChar, kkSpace:
       query.add(key.text)
       cursor = 0
+    of kkPaste:
+      query.add(strutils.splitWhitespace(stripAnsi(key.text)).join(" "))
+      cursor = 0
     of kkBackspace:
       if query.len > 0: query.setLen(runeOffset(query, runeLen(query) - 1))
       cursor = 0
     of kkEnter, kkNewline:
       if matches.len > 0:
         clearRenderedLines(rendered)
+        if not selectedQuery.isNil: selectedQuery[] = query
         return matches[cursor]
     of kkEscape, kkCtrlC, kkCtrlD, kkEof:
       clearRenderedLines(rendered)

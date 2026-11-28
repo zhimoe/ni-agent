@@ -37,6 +37,12 @@ type
     pastes: Table[int, string]
     pasteCounter: int
 
+  HistorySearch = object
+    active: bool
+    query: string
+    matches: seq[int]
+    position: int
+
   EditorCaret* = tuple[row, col: int]
 
   EditorStatusInfo* = object
@@ -81,6 +87,7 @@ type
     historyFile*: string
     historyIndex*: int     # history.len means editing live draft
     draftBeforeHistory: string
+    historySearch: HistorySearch
     commands*: seq[SlashCommandDef]
     modelItems*: seq[AutocompleteItem]
     workspaceRoot*: string
@@ -335,6 +342,7 @@ proc resetBuffer*(ed: InputEditor) =
   ed.undoStack.setLen(0)
   ed.historyIndex = ed.history.len
   ed.draftBeforeHistory = ""
+  ed.historySearch = HistorySearch()
   ed.acKind = ackNone
   ed.acItems.setLen(0)
   ed.acIndex = 0
@@ -644,11 +652,63 @@ proc openExternalEditor(ed: InputEditor): bool =
 
 # Deterministic single-key dispatcher (directly unit-testable without a TTY!)
 
+proc searchingHistory*(ed: InputEditor): bool =
+  ed.historySearch.active
+
+proc updateHistorySearch(ed: InputEditor) =
+  let query = unicode.toLower(ed.historySearch.query)
+  ed.historySearch.matches.setLen(0)
+  ed.historySearch.position = 0
+  for i in countdown(ed.history.high, 0):
+    if query in unicode.toLower(ed.history[i].replace('\n', ' ')):
+      ed.historySearch.matches.add(i)
+
+proc handleHistorySearchKey(ed: InputEditor, ev: KeyEvent) =
+  case ev.kind
+  of kkEscape, kkCtrlC, kkCtrlG:
+    ed.historySearch = HistorySearch()
+  of kkEnter:
+    if ed.historySearch.matches.len == 0: return
+    let index = ed.historySearch.matches[ed.historySearch.position]
+    ed.historySearch = HistorySearch()
+    ed.saveUndoSnapshot()
+    if ed.historyIndex == ed.history.len:
+      ed.draftBeforeHistory = ed.expandedText()
+    ed.historyIndex = index
+    ed.pastes.clear()
+    ed.setText(ed.history[index])
+  of kkCtrlR, kkUp, kkCtrlP:
+    ed.historySearch.position = min(ed.historySearch.position + 1, max(0, ed.historySearch.matches.high))
+  of kkDown, kkCtrlN:
+    ed.historySearch.position = max(0, ed.historySearch.position - 1)
+  of kkChar, kkSpace, kkPaste:
+    let text = if ev.text.len > 0: ev.text elif ev.ch != '\0': $ev.ch else: ""
+    ed.historySearch.query.add(text.replace('\n', ' ').replace('\r', ' '))
+    ed.updateHistorySearch()
+  of kkBackspace:
+    let query = ed.historySearch.query
+    ed.historySearch.query.setLen(prevUtf8Index(query, query.len))
+    ed.updateHistorySearch()
+  of kkCtrlU:
+    ed.historySearch.query.setLen(0)
+    ed.updateHistorySearch()
+  else: discard
+
 proc handleKeyEvent*(ed: InputEditor, ev: KeyEvent, allowExternalEditor = false): Option[EditorOutcome] =
   ## Process one KeyEvent in the editor; return `some(EditorOutcome)` when submitting/cancelling/EOF, or `none` to continue editing.
+  if ed.searchingHistory() and ev.kind != kkEof:
+    ed.handleHistorySearchKey(ev)
+    return none(EditorOutcome)
   case ev.kind
   of kkEof:
     return some(EditorOutcome(kind: eokEof))
+
+  of kkCtrlR:
+    ed.historySearch = HistorySearch(active: true)
+    ed.acKind = ackNone
+    ed.acItems.setLen(0)
+    ed.updateHistorySearch()
+    return none(EditorOutcome)
 
   of kkCtrlC:
     if ed.acKind != ackNone:
@@ -1001,7 +1061,9 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
   let cols = clamp(termCols, 20, 300)
   # Reserve the two borders, footer, and one visible input row before showing queues or suggestions.
   let showWorking = status.workingStatus.len > 0 and maxRows >= 5
-  let spareRows = max(4, maxRows) - 4 - int(showWorking)
+  let searching = ed.searchingHistory()
+  let showMatch = searching and maxRows >= 5 + int(showWorking)
+  let spareRows = max(4, maxRows) - 4 - int(showWorking) - int(showMatch)
   let queueRows = min(status.queuedMessages.len, spareRows div 3)
   let totalSuggestions = if ed.acKind != ackNone: ed.acItems.len else: 0
   let menuRows = min(totalSuggestions, min(AutocompleteMaxVisible + 1, (spareRows - queueRows + 1) div 2))
@@ -1044,22 +1106,37 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
 
   if showWorking:
     result.add(truncateVisible("  " & status.workingStatus, cols))
-  let shellPrefix = ed.shellPrefixLen()
+  if showMatch:
+    let search = ed.historySearch
+    if search.matches.len == 0:
+      result.add(styleDim("  No matching history"))
+    else:
+      let hit = ed.history[search.matches[search.position]].replace('\n', ' ')
+      let index = $(search.position + 1) & "/" & $search.matches.len
+      result.add(styleDim(fitScreenRow("  " & index & "  " & stripAnsi(hit), cols)))
+  let shellPrefix = if searching: 0 else: ed.shellPrefixLen()
   let rule = "─".repeat(cols)
-  if shellPrefix > 0:
+  if searching:
+    let label = "── History search "
+    result.add(styleCyan(label & "─".repeat(cols - visibleWidth(label))))
+  elif shellPrefix > 0:
     let label = truncateVisible(if shellPrefix == 2: "── Bash · Local only " else: "── Bash ", cols)
     result.add(styleYellow(label & "─".repeat(cols - visibleWidth(label))))
   else:
     result.add(styleDim(rule))
 
-  let prefixFirst = if shellPrefix > 0: styleYellow("$ ") else: styleBold(styleCyan("❯ "))
+  let prefixFirst = if searching: styleCyan("? ")
+    elif shellPrefix > 0: styleYellow("$ ") else: styleBold(styleCyan("❯ "))
   let prefixCont = if shellPrefix > 0: styleYellow("· ") else: styleDim("· ")
   let contentWidth = max(10, cols - 3)
 
-  let isEmpty = ed.lines.len == 1 and ed.lines[0].len == 0
+  let inputLines = if searching: @[ed.historySearch.query] else: ed.lines
+  let isEmpty = inputLines.len == 1 and inputLines[0].len == 0
   if isEmpty:
     if not caret.isNil: caret[] = (result.len, 2)
-    let hintStr = if status.workingStatus.len > 0:
+    let hintStr = if searching:
+      "Type to filter · Ctrl+R older · Enter recall · Esc cancel"
+    elif status.workingStatus.len > 0:
       "Type a message…"
     else:
       "Ask anything · /commands · @file · !shell · Ctrl+J newline"
@@ -1070,8 +1147,8 @@ proc renderEditorFrame*(ed: InputEditor, status: EditorStatusInfo, termCols: int
   else:
     var wrappedInput: seq[string] = @[]
     var cursor: EditorCaret
-    for lineIdx, line in ed.lines.pairs:
-      let col = if lineIdx == ed.cursorLine: ed.cursorCol else: -1
+    for lineIdx, line in inputLines.pairs:
+      let col = if searching: line.len elif lineIdx == ed.cursorLine: ed.cursorCol else: -1
       let (wrapped, lineCaret) = formatEditorLineWithCursor(line, col, contentWidth)
       if lineCaret.row >= 0:
         cursor = (wrappedInput.len + lineCaret.row, lineCaret.col)
@@ -1186,17 +1263,19 @@ proc readPromptInteractive*(ed: InputEditor, status: EditorStatusInfo): EditorOu
 
   while true:
     let (cols, rows) = terminalSize()
-    let frame = renderEditorFrame(ed, status, cols, rows - 1)
+    let frame = renderEditorFrame(ed, status, cols - 1, rows - 1)
 
     beginSyncOutput()
     clearRenderedLines(renderedCount)
     for line in frame:
-      stdout.write(line & "\n")
+      stdout.write(fitScreenRow(line, cols - 1) & "\n")
     renderedCount = frame.len
     endSyncOutput()
 
     let ev = readRawKey()
-    if ev.kind == kkCtrlG:
+    if ev.kind == kkCtrlL:
+      continue
+    if ev.kind == kkCtrlG and not ed.searchingHistory():
       exitRawTerminalMode()
       try:
         discard ed.handleKeyEvent(ev, allowExternalEditor = true)

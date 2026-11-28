@@ -1,7 +1,8 @@
 # Interactive Docked TUI (persistent bottom input bar, live status border, searchable /model selector, streaming Markdown), print & JSONL modes.
 
-import std/[algorithm, json, monotimes, options, os, sets, strutils, tables, times]
-import ./[types, config, trust, provider, tools, skills, mcp, session, agent, brand, terminal_io, keybindings, editor, markdown, viewport, utf8, release_info, herdr]
+import std/[algorithm, json, monotimes, options, os, sequtils, sets, strutils, tables, times]
+from std/unicode import toLower
+import ./[types, config, trust, provider, tools, skills, mcp, session, agent, brand, terminal_io, keybindings, editor, markdown, viewport, utf8, release_info, herdr, workspace_diff]
 
 type
   DockViewport* = ref object
@@ -94,6 +95,8 @@ proc buildSlashCommandDefs*(rt: AgentRuntime): seq[SlashCommandDef] =
     SlashCommandDef(name: "model", argumentHint: "[provider/model]", description: "Search & switch model (configured providers)", source: "builtin"),
     SlashCommandDef(name: "thinking", argumentHint: "[level]", description: "Set reasoning level (off, low, medium, high, xhigh, max)", source: "builtin"),
     SlashCommandDef(name: "copy", argumentHint: "[last|code|diff|<N>]", description: "Copy last reply, fenced code block, or edit diff", source: "builtin"),
+    SlashCommandDef(name: "diff", description: "Show staged, unstaged, and untracked workspace changes", source: "builtin"),
+    SlashCommandDef(name: "search", argumentHint: "[query]", description: "Search the full active conversation", source: "builtin"),
     SlashCommandDef(name: "new", description: "Start a brand-new session", source: "builtin"),
     SlashCommandDef(name: "resume", description: "Select and resume a saved session", source: "builtin"),
     SlashCommandDef(name: "tree", description: "Navigate session tree and switch branches", source: "builtin"),
@@ -182,14 +185,14 @@ proc buildEditorStatus*(rt: AgentRuntime, gitBranch: string, workingStatus = "",
 
 # Persistent Docked Viewport Manager (keeps input box + status footer anchored at bottom at all times)
 
-proc newDockViewport*(rt: AgentRuntime, ed: InputEditor): DockViewport =
+proc newDockViewport*(rt: AgentRuntime, ed: InputEditor, noAltScreen = false): DockViewport =
   DockViewport(
     rt: rt,
     ed: ed,
     transcript: newTranscript(),
     followUpKeys: loadFollowUpKeys(rt.cfg.agentDir),
     gitBranch: detectGitBranch(rt.cfg.cwd),
-    fullScreen: supportsFullScreen()
+    fullScreen: not noAltScreen and supportsFullScreen()
   )
 
 proc isDockedActive(vp: DockViewport): bool =
@@ -446,23 +449,48 @@ proc summarizeToolArgs(name: string, args: JsonNode): string =
     let s = $args
     if s.len > 72: s[0 ..< 69] & "..." else: s
 
-proc formatColoredDiffLines*(diff: string): seq[string] =
+proc formatColoredDiffLines*(diff: string, width = 0): seq[string] =
   ## Format unified diff lines with colored +/- styling.
-  for line in diff.splitLines():
-    if line.startsWith("+++") or line.startsWith("---"):
-      result.add("  " & styleBold(line))
-    elif line.startsWith("@@"):
-      result.add("  " & styleCyan(line))
-    elif line.startsWith("+"):
-      result.add("  " & styleGreen(line))
-    elif line.startsWith("-"):
-      result.add("  " & styleRed(line))
+  for raw in diff.splitLines():
+    let line = if width > 0: fitScreenRow(stripAnsi(raw), high(int)) else: raw
+    let styled =
+      if line.startsWith("+++") or line.startsWith("---"): styleBold(line)
+      elif line.startsWith("@@"): styleCyan(line)
+      elif line.startsWith("+"): styleGreen(line)
+      elif line.startsWith("-"): styleRed(line)
+      else: styleDim(line)
+    if width > 0:
+      result.add(wrapAnsiText(styled, width, firstIndent = "  ", contIndent = "    "))
     else:
-      result.add("  " & styleDim(line))
+      result.add("  " & styled)
 
 proc renderColoredDiff*(diff: string) =
   for l in formatColoredDiffLines(diff):
     stdout.writeLine(l)
+
+proc handleWorkspaceDiff(vp: DockViewport) =
+  try:
+    let sections = readWorkspaceDiff(vp.rt.cfg.cwd, vp.rt.security)
+    let width = max(8, terminalSize().cols - 1)
+    var lines = @[styleBold("  Workspace diff")]
+    if sections.len == 0:
+      lines.add("  No workspace changes.")
+    for section in sections:
+      lines.add("")
+      lines.add("  " & styleBold(section.title))
+      lines.add(formatColoredDiffLines(section.patch, width))
+    lines.add("")
+    if vp.fullScreen:
+      let first = vp.transcript.totalLines()
+      discard vp.transcript.beginSegment(segNotice, "Workspace diff")
+      vp.transcript.addLines(lines)
+      vp.transcript.revealLine(first)
+      vp.redrawDock()
+    else:
+      vp.printAboveDock(lines)
+  except CatchableError as error:
+    let message = fitScreenRow(stripAnsi(error.msg), high(int))
+    vp.printAboveDock("  " & styleRed("Could not read workspace diff: " & message))
 
 proc indentLines(lines: openArray[string], pad = "  "): seq[string] =
   for l in lines:
@@ -482,42 +510,120 @@ proc restoreTranscript(vp: DockViewport, banner: openArray[string] = []) =
   vp.transcript.addLines(banner)
   for entry in vp.rt.session.activeBranchEntries():
     if entry.kind == sekCompaction:
-      discard vp.transcript.beginSegment(segNotice, "Context compacted")
+      discard vp.transcript.beginSegment(segNotice, "Context compacted", entry.id)
       vp.transcript.addLines(@[styleMagenta("  ⟳ Conversation compacted"), ""])
     if entry.kind != sekMessage: continue
     let msg = entry.message
     case msg.role
     of mrUser:
       let text = stripAnsi(collectText(msg.userBlocks))
-      discard vp.transcript.beginSegment(segUser, promptTitle(text))
+      discard vp.transcript.beginSegment(segUser, promptTitle(text), entry.id)
       vp.transcript.addLines(renderUserPromptBlock(text, cols))
     of mrAssistant:
       let thinking = stripAnsi(collectThinking(msg.assistantBlocks))
       if thinking.len > 0 and not vp.rt.cfg.settings.hideThinkingBlock:
-        discard vp.transcript.beginSegment(segThinking)
+        discard vp.transcript.beginSegment(segThinking, entryId = entry.id)
         vp.transcript.addLines(renderThinkingLines(thinking, cols) & @[""])
       let text = stripAnsi(collectText(msg.assistantBlocks))
       if text.len > 0:
-        discard vp.transcript.beginSegment(segAssistant, msg.model)
+        discard vp.transcript.beginSegment(segAssistant, msg.model, entry.id)
         vp.transcript.addLines(indentLines(renderMarkdown(text, max(20, cols - 4))) & @[""])
       for call in collectToolCalls(msg.assistantBlocks):
-        discard vp.transcript.beginSegment(segTool, call.name)
+        discard vp.transcript.beginSegment(segTool, call.name, entry.id)
         let args = stripAnsi(summarizeToolArgs(call.name, call.arguments))
         vp.transcript.addLines(@["  " & styleCyan("● " & stripAnsi(call.name)) & (if args.len > 0: " " & styleDim(args) else: "")])
       if msg.errorMessage.len > 0:
-        discard vp.transcript.beginSegment(segNotice)
+        discard vp.transcript.beginSegment(segNotice, entryId = entry.id)
         vp.transcript.addLines(@[styleRed("  ✗ " & stripAnsi(msg.errorMessage))])
     of mrToolResult:
       if msg.isError:
         let output = stripAnsi(collectText(msg.resultBlocks)).splitLines()
         if output.len > 0:
+          discard vp.transcript.beginSegment(segTool, msg.toolName, entry.id)
           vp.transcript.addLines(@["    " & styleRed("✗ " & output[0])])
       elif msg.diff.len > 0:
+        discard vp.transcript.beginSegment(segTool, msg.toolName, entry.id)
         vp.transcript.addLines(formatColoredDiffLines(stripAnsi(msg.diff)))
     of mrSystem:
       discard
   if vp.fullScreen: vp.redrawDock()
   else: vp.redrawDock(vp.transcript.lines)
+
+type ConversationSearchItem* = object
+  entryId*: string
+  option*: QuestionOption
+
+proc conversationSearchItems*(session: SessionManager): seq[ConversationSearchItem] =
+  let branch = session.activeBranchEntries()
+  for i in countdown(branch.high, 0):
+    let entry = branch[i]
+    var label, body: string
+    case entry.kind
+    of sekCompaction:
+      label = "Summary"
+      body = entry.summary
+    of sekMessage:
+      let message = entry.message
+      case message.role
+      of mrUser:
+        label = "User"
+        body = collectText(message.userBlocks)
+      of mrAssistant:
+        label = "Assistant"
+        body = collectText(message.assistantBlocks)
+        for call in collectToolCalls(message.assistantBlocks):
+          body.add("\n" & call.name & " " & $call.arguments)
+        if message.errorMessage.len > 0: body.add("\n" & message.errorMessage)
+      of mrToolResult:
+        label = "Tool · " & message.toolName
+        body = collectText(message.resultBlocks)
+        if message.diff.len > 0: body.add("\n" & message.diff)
+      of mrSystem: continue
+    else: continue
+    body = stripAnsi(replaceInvalidUtf8(body)).strip()
+    if body.len > 0:
+      result.add(ConversationSearchItem(entryId: entry.id,
+        option: QuestionOption(label: label & " · #" & $(i + 1), description: body)))
+
+proc searchLineScore(line, phrase: string, terms: openArray[string]): int =
+  let folded = strutils.splitWhitespace(toLower(stripAnsi(line))).join(" ")
+  if phrase in folded: return terms.len + 1
+  for term in terms:
+    if term in folded: inc result
+
+proc visibleSearchLine(t: Transcript, entryId: string, terms: openArray[string]): int =
+  let phrase = terms.join(" ")
+  result = -1
+  for i, line in t.lines:
+    let segment = t.segments[t.segmentAt(i)]
+    if segment.entryId != entryId or segment.kind == segThinking: continue
+    let score = searchLineScore(line, phrase, terms)
+    if score > terms.len: return i
+    if score == terms.len and result < 0: result = i
+
+proc showConversationMatch(vp: DockViewport, item: ConversationSearchItem, query: string) =
+  let terms = searchTerms(query)
+  let phrase = terms.join(" ")
+  let (cols, _) = terminalSize()
+  let width = max(1, cols - 5)
+  let body = item.option.description.splitLines()
+  var matched = 0
+  var best = 0
+  for i, line in body:
+    let score = searchLineScore(line, phrase, terms)
+    if score > best:
+      matched = i
+      best = score
+    if score > terms.len: break
+  var lines = @[styleBold("  Conversation match · " & item.option.label)]
+  for i in max(0, matched - 2) .. min(body.high, matched + 3):
+    let preview = if i == matched: searchExcerpt(body[i], terms, width)
+      else: truncateVisible(body[i], width)
+    let content = fitScreenRow(preview, width)
+    lines.add(if i == matched: "  " & styleCyan("› " & content) else: "    " & content)
+  lines.add("")
+  vp.transcript.scrollToBottom()
+  vp.printAboveDock(lines)
 
 proc pickSavedSession*(sessions: openArray[SessionSummaryInfo]): int =
   var options: seq[QuestionOption]
@@ -526,11 +632,11 @@ proc pickSavedSession*(sessions: openArray[SessionSummaryInfo]): int =
       description: info.id & " · " & $info.messageCount & " messages · " & info.timestamp))
   selectSearchableOption("Resume session", options)
 
-proc runStopMessage(msg: AgentMessage): string =
+proc runStopMessage(msg: AgentMessage, turnLimit: int): string =
   case msg.stopReason
   of srStop: ""
   of srLength: "Model response reached its output limit"
-  of srTurnLimit: "Agent reached the limit of " & $MaxAgentTurnsPerRun & " turns"
+  of srTurnLimit: "Agent reached the limit of " & $turnLimit & (if turnLimit == 1: " turn" else: " turns")
   of srAborted: "Run cancelled"
   of srError: (if msg.errorMessage.len > 0: msg.errorMessage else: "Model request failed")
   of srToolUse: "Run ended before the model completed its response"
@@ -587,12 +693,13 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
         if inText: mdStream.finishStream(); inText = false
       of aekRunEnd:
         if ev.finalMessage.stopReason in {srLength, srTurnLimit, srToolUse}:
-          stdout.writeLine(styleYellow(runStopMessage(ev.finalMessage)))
+          stdout.writeLine(styleYellow(runStopMessage(ev.finalMessage, ev.totalTurns)))
       else: discard
 
   # Docked TUI streaming printer: streams rendered Markdown & tool calls above the fixed bottom input bar
   var thinkingBuf = ""
   var inText = false
+  var firstTurnSegment = 0
   var mdStream = newStreamMarkdownRenderer()
 
   proc flushThinkingAboveDock() =
@@ -623,10 +730,17 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
       vp.setWorkingStatus("Thinking")
 
     of aekMessage:
+      let current = vp.transcript.currentSegment()
       if ev.observedMessage.role == mrUser:
+        if vp.transcript.segments[current].kind == segUser and vp.transcript.segments[current].entryId.len == 0:
+          vp.transcript.segments[current].entryId = vp.rt.session.leafId
         vp.redrawDock()
+      elif ev.observedMessage.role == mrToolResult and vp.transcript.segments[current].kind == segTool and
+          vp.transcript.segments[current].entryId.len == 0:
+        vp.transcript.segments[current].entryId = vp.rt.session.leafId
 
     of aekTurnStart:
+      firstTurnSegment = vp.transcript.segments.len
       thinkingBuf = ""
       inText = false
       mdStream = newStreamMarkdownRenderer(max(28, cols - 4))
@@ -713,6 +827,8 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
         flushTextAboveDock()
 
     of aekAssistantEnd:
+      for i in firstTurnSegment ..< vp.transcript.segments.len:
+        vp.transcript.segments[i].entryId = ev.assistantEntryId
       vp.redrawDock()
 
     of aekRunEnd:
@@ -720,7 +836,7 @@ proc makeInteractiveEventPrinter*(hideThinking: bool, vp: DockViewport = nil): A
       vp.activeTailLines.setLen(0)
       if ev.finalMessage.stopReason in {srLength, srTurnLimit, srToolUse}:
         discard vp.transcript.beginSegment(segNotice)
-        vp.redrawDock(@["  " & styleYellow(runStopMessage(ev.finalMessage))])
+        vp.redrawDock(@["  " & styleYellow(runStopMessage(ev.finalMessage, ev.totalTurns))])
       else:
         vp.redrawDock()
       vp.flushPaint(immediate = true)
@@ -937,7 +1053,7 @@ proc runPrintMode*(rt: AgentRuntime, prompt: string, explicitFiles: seq[string])
     else:
       stdout.writeLine(txt)
   if exitCode != 0:
-    stderr.writeLine("Error: " & runStopMessage(finalMsg))
+    stderr.writeLine("Error: " & runStopMessage(finalMsg, rt.maxTurnsPerRun))
   exitCode
 
 proc writeAgentJson(record: JsonNode) =
@@ -1056,7 +1172,7 @@ proc makeJsonEventPrinter*(): AgentEventCallback =
       let ended = %*{"type": "agent_end", "messages": messages, "willRetry": false,
         "turns": ev.totalTurns, "stopReason": $reason, "exitCode": runExitCode(reason)}
       if reason != srStop:
-        ended["errorMessage"] = %runStopMessage(ev.finalMessage)
+        ended["errorMessage"] = %runStopMessage(ev.finalMessage, ev.totalTurns)
       emit(ended)
       emit(%*{"type": "agent_settled", "aborted": ev.finalMessage.stopReason == srAborted})
 
@@ -1077,6 +1193,8 @@ proc helpMarkdown(): string =
 | `/model [query]` | Interactive model selector (configured providers, `Ctrl+S` save default) |
 | `/thinking [level]` | Set reasoning effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) |
 | `/copy [last\|code\|diff\|<N>]` | Copy last reply, fenced code block, or edit diff to clipboard |
+| `/diff` | Show the staged, unstaged, and untracked changes in this Git workspace |
+| `/search [query]` | Find text in the current conversation, including older saved messages |
 | `/new` · `/resume` · `/clear` | Start new session, resume saved session, or reset root branch |
 | `/tree` · `/fork` · `/export` | Switch session tree branch, fork session, or export HTML/MD/JSONL |
 | `/compact` · `/session` · `/name` | Compact context history, inspect token/cost stats, or rename session |
@@ -1096,6 +1214,7 @@ proc hotkeysMarkdown(): string =
 | `!` at the start | Open Bash mode. `Enter` runs the command or queues it until the reply finishes. |
 | `Alt+Enter` (`Ctrl+Q` on Windows) | Default shortcut to queue a follow-up after the current reply |
 | `Ctrl+J` / `Shift+Enter` | Insert newline (or end line with `\`) |
+| `Ctrl+R` | Search input history. Repeat to go older, Enter to recall, or Esc to cancel. |
 | `Tab` / `Shift+Tab` | Trigger or accept `/command`, `/model`, and `@file` autocomplete |
 | `↑` / `↓` · `Ctrl+P` / `Ctrl+N` | Navigate lines, autocomplete popup, or persistent history |
 | `Alt+B` / `Alt+F` · `Ctrl+A` / `Ctrl+E` | Jump by word or start/end of line |
@@ -1274,8 +1393,8 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
       if kev.kind == kkEof:
         runAbort.aborted = true
         break
-      if (kev.kind == kkEscape and vp.ed.acKind == ackNone) or
-          (kev.kind == kkCtrlC and vp.ed.currentText().len == 0):
+      if not vp.ed.searchingHistory() and ((kev.kind == kkEscape and vp.ed.acKind == ackNone) or
+          (kev.kind == kkCtrlC and vp.ed.currentText().len == 0)):
         runAbort.aborted = true
         vp.setWorkingStatus("Interrupting")
       else:
@@ -1309,8 +1428,9 @@ proc runAgentTurnDocked(vp: DockViewport, prompt: string, explicitFiles: openArr
   )
   vp.ed.invalidateFileCache()
 
-proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq[string] = @[]): int =
-  ## Start the interactive ni TUI with a persistent docked input box and live Markdown rendering.
+proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq[string] = @[],
+                         noAltScreen = false): int =
+  ## Run the interactive editor in a fixed viewport or the terminal's regular scrollback.
   installCtrlCHandler()
   let reporter = newHerdrReporter()
   let ask = rt.askQuestion
@@ -1359,10 +1479,10 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
     commands = buildSlashCommandDefs(rt),
     modelItems = buildModelAutocompleteItems(rt)
   )
-  let vp = newDockViewport(rt, ed)
+  let vp = newDockViewport(rt, ed, noAltScreen)
   if vp.fullScreen:
-    enterRawTerminalMode()
     enterFullScreen()
+    enterRawTerminalMode()
   defer:
     if vp.fullScreen:
       vp.suspendDock()
@@ -1384,6 +1504,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
     defer:
       activeRunAbort = nil
       vp.setWorkingStatus()
+      vp.activeTailLines.setLen(0)
       vp.redrawDock()
       reporter.report(hsIdle)
     if vp.fullScreen:
@@ -1402,30 +1523,54 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       header.add("    " & commandLines[i])
     vp.workingStarted = getMonoTime()
     vp.setWorkingStatus("Running shell", commandLines[0])
-    if vp.fullScreen:
-      discard vp.transcript.beginSegment(segNotice, "$ " & commandLines[0])
+    let shellSegment = if vp.fullScreen: vp.transcript.beginSegment(segNotice, "$ " & commandLines[0])
+      else: -1
     vp.redrawDock(header)
+
+    var pendingLine = ""
+    proc shellOutputLine(line: string): string =
+      let content = line.strip(leading = false, chars = {'\r'})
+      "  " & (if vp.fullScreen: content else: fitScreenRow(stripAnsi(content), high(int)))
+
+    proc streamShellOutput(chunk: string) =
+      let parts = chunk.split('\n')
+      pendingLine.add(parts[0])
+      var committed: seq[string]
+      if parts.len > 1:
+        committed.add(shellOutputLine(pendingLine))
+        for line in parts[1 ..< parts.high]:
+          committed.add(shellOutputLine(line))
+        pendingLine = parts[^1]
+      if vp.fullScreen:
+        vp.activeTailLines.setLen(0)
+        if pendingLine.len > 0:
+          let preview = utf8BoundaryBefore(pendingLine, min(pendingLine.len, 4096))
+          vp.activeTailLines.add(shellOutputLine(pendingLine[0 ..< preview]))
+      vp.redrawDock(committed)
+
     let res = try:
-      runInteractiveUserShell(command, rt.cfg.cwd, rt.cfg.settings, rt.security, runAbort)
+      runInteractiveUserShell(command, rt.cfg.cwd, rt.cfg.settings, rt.security, runAbort,
+        onOutput = streamShellOutput)
     except CatchableError as e:
       vp.printAboveDock("  " & styleRed(e.msg))
       return true
 
-    let output = res.output.replace("\r\n", "\n")
+    vp.activeTailLines.setLen(0)
     var lines: seq[string]
-    let shownOutput = if vp.fullScreen: output else: stripAnsi(output)
-    if shownOutput.len > 0:
-      for line in shownOutput.strip(leading = false, trailing = true).split('\n'):
-        lines.add("  " & line)
-    if res.exitCode != 0:
+    if pendingLine.len > 0:
+      lines.add(shellOutputLine(pendingLine))
+    if res.aborted:
+      lines.add("  " & styleYellow("[cancelled]"))
+    elif res.exitCode != 0:
       lines.add("  " & styleYellow("[exit code " & $res.exitCode & "]"))
     lines.add("")
     if prefix == 1:
-      let trunc = truncateHead(output)
-      discard rt.session.appendMessage(newUserMessage(
+      let trunc = truncateHead(res.output.replace("\r\n", "\n"))
+      let entryId = rt.session.appendMessage(newUserMessage(
         "<user_shell command=\"" & command & "\" exit_code=\"" & $res.exitCode & "\">\n" & trunc.content & "\n</user_shell>"
       ))
-    vp.printAboveDock(lines)
+      if shellSegment >= 0: vp.transcript.segments[shellSegment].entryId = entryId
+    vp.redrawDock(lines)
     ed.invalidateFileCache()
     true
 
@@ -1439,7 +1584,11 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         vp.queuedShellCommands.delete(0)
         discard tryRunShell(command)
     else:
-      discard rt.runPrompt(prompt, explicitFiles, onEvent = makeInteractiveEventPrinter(rt.cfg.settings.hideThinkingBlock))
+      let runAbort = newAbortFlag()
+      activeRunAbort = runAbort
+      defer: activeRunAbort = nil
+      discard rt.runPrompt(prompt, explicitFiles,
+        onEvent = makeInteractiveEventPrinter(rt.cfg.settings.hideThinkingBlock), abort = runAbort)
 
   vp.restoreTranscript(banner)
   if initialPrompt.strip().len > 0 or initialFiles.len > 0:
@@ -1452,46 +1601,38 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
   else:
     reporter.report(hsIdle)
 
-  # An inline editor or host-managed line input always remains available.
-  if not vp.fullScreen:
+  proc suspendEditor() =
+    vp.suspendDock()
+    if vp.fullScreen: exitRawTerminalMode()
+
+  proc resumeEditor() =
+    if vp.fullScreen: enterRawTerminalMode()
+    vp.resumeDock()
+
+  proc readDockedInput(): EditorOutcome =
     while true:
-      let status = buildEditorStatus(rt, vp.gitBranch)
-      let outcome = ed.readPromptInteractive(status)
-      if outcome.kind == eokEof: break
-      if outcome.kind != eokSubmit: continue
-      let trimmed = outcome.text.strip()
-      if trimmed in ["/quit", "/exit", "/q"]:
-        break
-      if trimmed.len > 0 and not tryRunShell(trimmed):
-        runTurn(outcome.text)
-    return 0
-
-  # Main persistent docked TUI loop
-  while true:
-    vp.flushPaint()
-    let waitMs = if vp.isDockedActive() and vp.paintPending:
-      max(1, (vp.nextPaint - getMonoTime()).inMilliseconds + 1).int else: 100
-    let event = vp.pollDockKey(waitMs)
-    if event.isNone:
-      if vp.fullScreen and terminalSize() != vp.drawnSize:
-        vp.redrawDock()
-      continue
-    let ev = event.get
-    if ev.kind == kkCtrlG:
-      vp.suspendDock()
-      exitRawTerminalMode()
-      discard ed.handleKeyEvent(ev, allowExternalEditor = true)
-      enterRawTerminalMode()
-      vp.resumeDock()
-      continue
-
-    let outcomeOpt = vp.handleDockKey(ev)
-    if outcomeOpt.isNone:
+      vp.flushPaint()
+      let waitMs = if vp.isDockedActive() and vp.paintPending:
+        max(1, (vp.nextPaint - getMonoTime()).inMilliseconds + 1).int else: 100
+      let event = vp.pollDockKey(waitMs)
+      if event.isNone:
+        if terminalSize() != vp.drawnSize:
+          vp.redrawDock()
+        continue
+      let ev = event.get
+      if ev.kind == kkCtrlG and not ed.searchingHistory():
+        suspendEditor()
+        try: discard ed.handleKeyEvent(ev, allowExternalEditor = true)
+        finally: resumeEditor()
+        continue
+      let outcome = vp.handleDockKey(ev)
+      if outcome.isSome: return outcome.get
       sigintCount = 0
       vp.redrawDock()
-      continue
 
-    let outcome = outcomeOpt.get
+  while true:
+    let outcome = if vp.fullScreen: readDockedInput()
+      else: ed.readPromptInteractive(buildEditorStatus(rt, vp.gitBranch))
     case outcome.kind
     of eokEof:
       vp.suspendDock()
@@ -1519,7 +1660,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
     # 2. Slash commands (except `/skill:<name>` and matching `/<prompt-template>`, which run as agent prompts)
     if trimmed.startsWith("/") and not trimmed.startsWith("/skill:"):
       if expandPromptTemplateCommand(trimmed, rt.promptTemplates).isSome:
-        vp.beginUserTurn(outcome.displayText, cols)
+        if vp.fullScreen: vp.beginUserTurn(outcome.displayText, cols)
         runTurn(rawInput)
         continue
 
@@ -1537,10 +1678,48 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         vp.printAboveDock(indentLines(renderMarkdown(hotkeysMarkdown(), max(36, cols - 4)), "  ") & @[""])
       of "/copy":
         handleCopyCommand(rt, arg, vp)
+      of "/diff":
+        if arg.len == 0: handleWorkspaceDiff(vp)
+        else: vp.printAboveDock("  " & styleYellow("Usage: /diff"))
+      of "/search":
+        let items = conversationSearchItems(rt.session)
+        if items.len == 0:
+          vp.printAboveDock("  " & styleDim("No searchable conversation messages yet."))
+          continue
+        var query = stripAnsi(arg)
+        if not supportsAnsiOutput():
+          let terms = searchTerms(query)
+          if terms.len == 0:
+            vp.printAboveDock("  " & styleYellow("Use /search <text> to search in this terminal."))
+            continue
+          var hit = -1
+          for i, item in items:
+            let searchable = toLower(item.option.label & " " & item.option.description)
+            if terms.allIt(it in searchable):
+              hit = i
+              break
+          if hit >= 0: showConversationMatch(vp, items[hit], query)
+          else: vp.printAboveDock("  " & styleDim("No matching conversation messages."))
+          continue
+
+        var picks: seq[QuestionOption]
+        for item in items: picks.add(item.option)
+        suspendEditor()
+        var selected, row = -1
+        try:
+          selected = selectSearchableOption("Search conversation", picks, query, addr query)
+          if selected >= 0 and vp.fullScreen:
+            row = vp.transcript.visibleSearchLine(items[selected].entryId, searchTerms(query))
+            if row >= 0: vp.transcript.revealLine(row)
+        finally:
+          resumeEditor()
+        if selected >= 0 and row < 0:
+          showConversationMatch(vp, items[selected], query)
       of "/model":
-        exitRawTerminalMode()
-        handleModelSlash(rt, arg, vp)
-        enterRawTerminalMode()
+        if vp.fullScreen: exitRawTerminalMode()
+        try: handleModelSlash(rt, arg, vp)
+        finally:
+          if vp.fullScreen: enterRawTerminalMode()
         vp.redrawDock()
       of "/thinking":
         let availLevels = supportedThinkingLevels(rt.currentModel)
@@ -1549,8 +1728,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
           rt.switchThinkingLevel(lv)
           vp.printAboveDock("  " & styleGreen("✓ Thinking level: ") & styleBold($lv))
         else:
-          vp.suspendDock()
-          exitRawTerminalMode()
+          suspendEditor()
           var opts: seq[QuestionOption] = @[]
           for lv in availLevels:
             let curTag = if lv == rt.thinkingLevel: " [current]" else: ""
@@ -1563,8 +1741,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
             multiSelect: false,
             allowOther: false
           ))
-          enterRawTerminalMode()
-          vp.resumeDock()
+          resumeEditor()
           if not ans.cancelled and ans.selected.len > 0:
             let rawLv = ans.selected[0].split(' ')[0]
             let lv = parseThinkingLevel(rawLv)
@@ -1572,18 +1749,16 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
             vp.printAboveDock("  " & styleGreen("✓ Thinking level: ") & styleBold($lv))
       of "/login":
         let prov = if arg.len > 0: arg else: rt.currentModel.provider
-        vp.suspendDock()
-        exitRawTerminalMode()
+        suspendEditor()
         stdout.write("  " & styleCyan("Enter API key for '" & prov & "' (or !command / $ENV_VAR): "))
         stdout.flushFile()
         var k = ""
-        if stdin.readLine(k) and k.strip().len > 0:
+        if readTerminalLine(k) and k.strip().len > 0:
           saveApiKeyCredential(rt.cfg.agentDir, prov, k.strip())
           rt.cfg.auth = loadAuthFile(rt.cfg.agentDir / "auth.json", rt.cfg.diagnostics)
           ed.modelItems = buildModelAutocompleteItems(rt)
           stdout.writeLine("  " & styleGreen("✓ Saved credential for '" & prov & "' in " & (rt.cfg.agentDir / "auth.json")))
-        enterRawTerminalMode()
-        vp.resumeDock()
+        resumeEditor()
       of "/logout":
         let prov = if arg.len > 0: arg else: rt.currentModel.provider
         if removeStoredCredential(rt.cfg.agentDir, prov):
@@ -1625,15 +1800,13 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
             let server = findMcpConfig(rt.cfg, words[1])
             case mcpAction
             of "login":
-              vp.suspendDock()
-              exitRawTerminalMode()
+              suspendEditor()
               try:
                 signInMcp(rt.cfg, server, announce = proc(url: string) =
                   stdout.writeLine("Authorize in a browser: " & url)
                   stdout.flushFile())
               finally:
-                enterRawTerminalMode()
-                vp.resumeDock()
+                resumeEditor()
             of "logout":
               signOutMcp(rt.cfg, server)
             else:
@@ -1711,16 +1884,14 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         if items.len == 0:
           vp.printAboveDock("  " & styleDim("Session tree is empty."))
         else:
-          vp.suspendDock()
-          exitRawTerminalMode()
+          suspendEditor()
           var opts: seq[QuestionOption] = @[]
           for item in items:
             let indent = "  ".repeat(min(6, item.depth))
             let leafTag = if item.isCurrentLeaf: " ← current" elif item.isActivePath: " ●" else: ""
             opts.add(QuestionOption(label: indent & "[" & item.entryId & "] " & item.roleLabel & leafTag, description: item.preview))
           let chosen = selectSearchableOption("Session tree", opts)
-          enterRawTerminalMode()
-          vp.resumeDock()
+          resumeEditor()
           if chosen >= 0:
             try:
               if rt.session.branchTo(items[chosen].entryId):
@@ -1734,8 +1905,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         if targetId.len == 0:
           let items = rt.session.buildSessionTreeItems()
           if items.len > 0:
-            vp.suspendDock()
-            exitRawTerminalMode()
+            suspendEditor()
             var opts = @[QuestionOption(label: "Current leaf (" & rt.session.leafId & ")", description: "Duplicate active branch")]
             var entryIds = @[rt.session.leafId]
             for item in items:
@@ -1750,8 +1920,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
               multiSelect: false,
               allowOther: false
             ))
-            enterRawTerminalMode()
-            vp.resumeDock()
+            resumeEditor()
             if ans.cancelled or ans.selected.len == 0:
               continue
             for i, opt in opts.pairs:
@@ -1775,11 +1944,9 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
         if sessions.len == 0:
           vp.printAboveDock("  " & styleYellow("No saved sessions found for this workspace."))
         else:
-          vp.suspendDock()
-          exitRawTerminalMode()
+          suspendEditor()
           let chosen = pickSavedSession(sessions)
-          enterRawTerminalMode()
-          vp.resumeDock()
+          resumeEditor()
           if chosen >= 0:
             try:
               rt.switchSession(rt.session.reopenSession(sessions[chosen].filePath))
@@ -1816,7 +1983,7 @@ proc runInteractiveRepl*(rt: AgentRuntime, initialPrompt = "", initialFiles: seq
       continue
 
     # 3. Normal user message or `/skill:<name>` -> render user block in the transcript + run docked agent turn
-    vp.beginUserTurn(outcome.displayText, cols)
+    if vp.fullScreen: vp.beginUserTurn(outcome.displayText, cols)
     runTurn(rawInput)
 
   0

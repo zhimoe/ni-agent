@@ -126,6 +126,26 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
     ]
     session.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
 
+    workspace = root / "workspace"
+    workspace.mkdir()
+    git = shutil.which("git")
+    if git:
+        def git_run(*args):
+            subprocess.run([git, *args], cwd=workspace, check=True, capture_output=True)
+
+        git_run("init", "-q")
+        (workspace / "tracked.txt").write_text("base\n")
+        (workspace / ".gitignore").write_text("ignored.txt\nallow-shell-finish\n")
+        git_run("add", ".")
+        git_run("-c", "user.name=Ni Test", "-c", "user.email=ni@example.invalid",
+                "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.devnull,
+                "commit", "-qm", "Initial commit")
+        (workspace / "tracked.txt").write_text("staged-content\n")
+        git_run("add", "tracked.txt")
+        (workspace / "tracked.txt").write_text("unstaged-content\n")
+        (workspace / "新 file.txt").write_text("untracked-content\n")
+        (workspace / "ignored.txt").write_text("ignored-content\n")
+
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 80, 0, 0))
     env = {**os.environ, "TERM": "xterm-256color", "NO_COLOR": "1"}
@@ -145,7 +165,7 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
     env["PATH"] = str(mock_bin) + os.pathsep + env["PATH"]
     command = [sys.argv[1], "--no-session", "--no-mcp", "--agent-dir", str(agent_dir),
                "--model", "local-test/stream", "--session", str(session)]
-    process = subprocess.Popen(command, cwd=root, env=env, stdin=slave, stdout=slave, stderr=slave)
+    process = subprocess.Popen(command, cwd=workspace, env=env, stdin=slave, stdout=slave, stderr=slave)
     try:
         initial = read_repaints(master)
         bottom = {}
@@ -228,6 +248,24 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
         shell_replay = read_repaints(master, marker=b"clear-beforeclear-after")
         assert b"\x1b[2J" not in shell_replay
 
+        os.write(master, b"\x12clear-before")
+        searched = read_repaints(master, marker=b"History search")
+        assert b"1/1" in searched and b"!printf" in searched
+        os.write(master, b"\r")
+        recalled = read_repaints(master, marker=b"Bash")
+        assert b"!printf" in recalled and b"Running shell" not in recalled
+        os.write(master, b"\x1b")
+        read_repaints(master, marker=b"Ask anything")
+
+        os.write(master, b"!!printf 'stream-%s\\npartial-%s' shell-first row-start; "
+                         b"while [ ! -f allow-shell-finish ]; do sleep 0.05; done; printf '%s\\n' '-done'\r")
+        progress = read_repaints(master, marker=b"partial-row-start")
+        assert b"stream-shell-first" in progress and b"partial-row-start-done" not in progress
+        assert b"\x1b[2J" not in progress and b"shell-startup-log" not in progress
+        (workspace / "allow-shell-finish").touch()
+        completed = read_repaints(master, marker=b"partial-row-start-done")
+        assert b"\x1b[2J" not in completed
+
         os.write(master, b"\x1b[200~" + b"Start response " * 32 + b"\x1b[201~\r")
         live_screen = bottom.copy()
         waiting = read_repaints(master, marker=b"Thinking (0s")
@@ -251,6 +289,10 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
         os.write(master, b"\x1b[<65;20;5M")
         apply_repaints(live_screen, read_repaints(master, marker=b"lines above"))
         assert any(b"STREAM_HOLD" in row for row in live_screen.values())
+        os.write(master, b"\x12invalid-history-query")
+        read_repaints(master, marker=b"No matching history")
+        os.write(master, b"\x1b")
+        read_repaints(master, marker=b"Type a message")
         os.write(master, b"!!printf 'queued-%s\\n' 'shell-done'\r")
         read_repaints(master, marker=b"Queued: !!printf")
         resume_model.set()
@@ -262,6 +304,23 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
         assert len(model_requests) == 1
         frames = (first + final).count(b"\x1b[?2026h")
         assert frames < 60, frames
+
+        # Search locates text that is older than the viewport and beyond the
+        # model's active output. Closing the selector must restore the editor.
+        os.write(master, b"/search HISTORY LINE 011\r")
+        matches = read_repaints(master, marker=b"Search conversation")
+        assert b"History line 011" in matches and b"No matching entries" not in matches
+        os.write(master, b"\r")
+        jumped = read_repaints(master, marker=b"History line 011")
+        assert b"Latest reply" not in jumped and b"\x1b[2J" not in jumped
+        if git:
+            os.write(master, b"/diff\r")
+            diff_start = read_repaints(master, marker=b"Workspace diff")
+            assert b"Staged changes" in diff_start and b"\x1b[2J" not in diff_start
+            os.write(master, b"\x1b[F")
+            diff_end = read_repaints(master, marker=b"+untracked-content")
+            assert b"Untracked files" in diff_end and b"\x1b[2J" not in diff_end
+        assert len(model_requests) == 1
     finally:
         start_model.set()
         resume_model.set()
@@ -271,17 +330,36 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
         os.close(slave)
 
     # Terminal sessions with no alternate screen must still accept a Unicode prompt.
-    for term in (None, "dumb"):
+    for term, explicit in ((None, False), ("dumb", False), ("xterm-256color", True)):
         fallback_env = env.copy()
         fallback_env.pop("TERM")
         if term is not None:
             fallback_env["TERM"] = term
         master, slave = pty.openpty()
-        process = subprocess.Popen(command, cwd=root, env=fallback_env, stdin=slave, stdout=slave, stderr=slave)
+        args = command + (["--no-alt-screen"] if explicit else [])
+        process = subprocess.Popen(args, cwd=workspace if explicit else root, env=fallback_env,
+                                   stdin=slave, stdout=slave, stderr=slave)
         try:
-            if term is None:
+            if term != "dumb":
                 shown = read_repaints(master, marker=b"Ask anything")
-                assert b"\x1b[?1049h" not in shown
+                assert b"\x1b[?1049h" not in shown and b"\x1b[?1002h" not in shown
+                if explicit:
+                    if git:
+                        os.write(master, b"/diff\r")
+                        diff = read_repaints(master, marker=b"+untracked-content")
+                        for heading in (b"Staged changes", b"Unstaged changes", b"Untracked files"):
+                            assert heading in diff
+                        assert b"+staged-content" in diff and b"+unstaged-content" in diff
+                        assert "新 file.txt".encode() in diff
+                        assert b"ignored.txt" not in diff and b"\x1b[?1049h" not in diff
+                    os.write(master, b"/session\r")
+                    report = read_repaints(master, marker=b"Ask anything")
+                    assert b"Session ID" in report and b"\x1b[?1049h" not in report
+                    os.write(master, b"\x12/session")
+                    search = read_repaints(master, marker=b"History search")
+                    assert b"1/" in search
+                    os.write(master, b"\x1b")
+                    read_repaints(master, marker=b"Ask anything")
                 os.write(master, b"!echo public-fallback\r")
                 read_repaints(master, marker=b"Ask anything")
                 os.write(master, b"!!echo private-fallback\r")
@@ -290,6 +368,9 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
                 output = read_repaints(master, marker=b"Ask anything")
             else:
                 shown = read_until(master, b"ni> ")
+                os.write(master, b"/search History line 011\r")
+                search_output = read_until(master, b"ni> ")
+                assert b"Conversation match" in search_output and b"History line 010" in search_output
                 os.write(master, b"!echo public-fallback\r")
                 shell_output = read_until(master, b"ni> ")
                 assert b"  public-fallback" in shell_output
@@ -303,7 +384,7 @@ with tempfile.TemporaryDirectory(prefix="ni-scroll-") as tmp, \
             request = json.dumps(model_requests[-1])
             assert "public-fallback" in request and "private-fallback" not in request
             os.write(master, b"/quit\r")
-            submitted = "❯ /quit\r\n".encode() if term is None else b"/quit\r\n"
+            submitted = "❯ /quit\r\n".encode() if term != "dumb" else b"/quit\r\n"
             read_until(master, submitted)
             assert process.wait(timeout=5) == 0
         finally:

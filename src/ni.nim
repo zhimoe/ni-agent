@@ -1,6 +1,6 @@
 # CLI entry point for `ni` coding agent (`ni`, `ni mcp ...`, `ni auth ...`).
 
-import std/[json, options, os, strutils, tables, terminal]
+import std/[json, options, os, strutils, tables]
 import ./ni/[types, config, trust, provider, tools, mcp, session, agent, terminal_io, tui, rpc, sandbox, utf8, release_info]
 
 type CliArgumentError = object of ValueError
@@ -30,6 +30,8 @@ Usage:
 Options:
   -p, --print                      Run prompt once, print final assistant text, and exit
       --mode <text|json|rpc>       Output interface (`text` default, `json` JSONL events, `rpc` headless JSONL RPC)
+      --no-alt-screen              Use the terminal's regular scrollback in interactive mode
+      --max-turns <N>              Limit agent turns per run (default: 64)
   -m, --model <pattern>            Select model (`provider/id` or pattern, optional `:thinking` suffix)
       --provider <name>            Select provider (`deepseek`, `anthropic`, `openai`, `google`, or custom ID)
       --api-key <key>              Runtime API key override (not written to disk)
@@ -398,6 +400,8 @@ proc main(): int =
 
   var printMode = false
   var outputMode = "text"
+  var noAltScreen = false
+  var maxTurns: Positive = MaxAgentTurnsPerRun
   var modelPat = ""
   var providerOv = ""
   var cliApiKey = ""
@@ -456,6 +460,14 @@ proc main(): int =
       outputMode = optionValue(rawArgs, i).toLowerAscii()
       if outputMode notin ["text", "json", "rpc"]:
         raise newException(CliArgumentError, "--mode expects text, json, or rpc")
+    of "--no-alt-screen":
+      noAltScreen = true
+    of "--max-turns":
+      let raw = optionValue(rawArgs, i)
+      let parsed = try: parseInt(raw) except ValueError: 0
+      if parsed <= 0:
+        raise newException(CliArgumentError, "--max-turns expects a positive integer")
+      maxTurns = parsed
     of "-m", "--model":
       modelPat = optionValue(rawArgs, i)
     of "--provider":
@@ -674,7 +686,8 @@ proc main(): int =
     askQuestion = (if isInteractive: promptAskQuestionsInteractive else: nil),
     promptTemplates = promptTplList,
     keepModel = modelPat.len > 0 or providerOv.len > 0,
-    keepThinking = thinkingOv.isSome or suffixThink.isSome
+    keepThinking = thinkingOv.isSome or suffixThink.isSome,
+    maxTurnsPerRun = maxTurns
   )
   rt.configOverrides = configOverrides
   rt.toolOverrides = toolOverrides
@@ -692,7 +705,7 @@ proc main(): int =
   if printMode:
     return runPrintMode(rt, initialPrompt, explicitFiles)
 
-  runInteractiveRepl(rt, initialPrompt, explicitFiles)
+  runInteractiveRepl(rt, initialPrompt, explicitFiles, noAltScreen = noAltScreen)
 
 when isMainModule:
   try:

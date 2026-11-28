@@ -1,7 +1,7 @@
 # Comprehensive unit & E2E tests for TUI width/wrapping, InputEditor, Markdown/Syntax renderer, Anthropic & Gemini SSE, Prompt Templates, Fuzzy Edit, Session Tree/Export, and `--mode rpc`.
 
 import std/[json, options, os, osproc, streams, strutils, tables, unittest]
-import ../src/ni/[types, config, trust, provider, tools, skills, mcp, session, agent, terminal_io, keybindings, editor, markdown, viewport]
+import ../src/ni/[types, config, trust, provider, tools, skills, mcp, session, agent, terminal_io, keybindings, editor, markdown, viewport, tui]
 
 proc readRpcOutput(stream: Stream): string =
   ## Windows pipes can return a short read between two JSONL responses.
@@ -144,6 +144,32 @@ suite "TUI Layout, Multi-line Input Editor, and Terminal Markdown Renderer":
     ed.setText("！echo literal")
     check "Bash" notin stripAnsi(renderEditorFrame(ed, status, 40)[0])
 
+  test "Reverse history search recalls older Unicode matches and preserves the draft on cancel":
+    let ed = newInputEditor(workspaceRoot = getTempDir())
+    ed.appendEditorHistory("first 中文\nfollow-up")
+    ed.appendEditorHistory("unrelated")
+    ed.appendEditorHistory("latest 中文")
+    ed.setText("unsent draft")
+    discard ed.handleKeyEvent(KeyEvent(kind: kkLeft))
+    let cursor = ed.cursorCol
+    let query = KeyEvent(kind: kkPaste, text: "中文")
+    let search = KeyEvent(kind: kkCtrlR)
+    discard ed.handleKeyEvent(search)
+    discard ed.handleKeyEvent(query)
+    check "latest 中文" in stripAnsi(renderEditorFrame(ed, EditorStatusInfo(), 65)[0])
+    discard ed.handleKeyEvent(search)
+    check "first 中文 follow-up" in stripAnsi(renderEditorFrame(ed, EditorStatusInfo(), 65)[0])
+    discard ed.handleKeyEvent(KeyEvent(kind: kkEscape))
+    check not ed.searchingHistory()
+    check ed.currentText() == "unsent draft" and ed.cursorCol == cursor
+
+    discard ed.handleKeyEvent(search)
+    discard ed.handleKeyEvent(query)
+    discard ed.handleKeyEvent(search)
+    check ed.handleKeyEvent(KeyEvent(kind: kkEnter)).isNone
+    check ed.currentText() == "first 中文\nfollow-up"
+    check ed.handleKeyEvent(KeyEvent(kind: kkEnter)).get.text == "first 中文\nfollow-up"
+
   test "Short terminals keep the active editor row and autocomplete within the dock":
     let ed = newInputEditor()
     let draft = "start\n" & "你好\n".repeat(10) & "finish"
@@ -277,6 +303,29 @@ proc greet*(name: string): int =
     check sawHighlightedProc
 
 suite "Fixed-layout transcript viewport (pinned dock, scrollback, sticky headers)":
+  test "Conversation search includes pre-compaction text from the active branch":
+    let sm = newSessionManager(getCurrentDir(), getTempDir(), persist = false)
+    let text = "History line 000 " & repeat("背景 ", 60) & "历史 line 011 and more"
+    let old = sm.appendMessage(newUserMessage(text))
+    discard sm.appendMessage(newUserMessage("Inactive sibling"))
+    check sm.branchTo(old)
+    let kept = sm.appendMessage(newUserMessage("Current branch"))
+    let tool = sm.appendMessage(newToolResultMessage("call-1", "edit",
+      ToolOutput(content: @[textBlock("operation output")], diff: "+新内容")))
+    let summary = sm.appendCompaction("Conversation summary", kept, 100)
+
+    let items = conversationSearchItems(sm)
+    require items.len == 4
+    check items[0].entryId == summary
+    check items[1].entryId == tool
+    check "+新内容" in items[1].option.description
+    check items[3].entryId == old
+    check items[3].option.description == text
+    let preview = searchExcerpt(text, searchTerms("历史 LINE 011"), 36)
+    check "历史 line 011" in preview
+    check visibleWidth(preview) <= 36
+    check sm.leafId == summary
+
   test "Frame rows keep styling and links while discarding terminal operations":
     let noisy = "a\x1b[2Jb\x1b[?2026lc\x1b]0;title\x07d\x1bPpayload\x1b\\e\t\r\nf"
     check fitScreenRow(noisy, 20) == "abcde    f"

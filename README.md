@@ -20,6 +20,12 @@ Ni uses `~/.pi/agent` by default. Pass `--agent-dir` to use a separate configura
 ./ni --mode rpc
 ```
 
+Use `./ni --no-alt-screen` to work in the terminal's regular scrollback with the same slash commands and input editor. Press `Ctrl+R` to search input history. Press it again for an older match, `Enter` to recall the match for editing, or `Esc` to keep your draft.
+
+Use `/diff` to inspect staged, unstaged, and untracked changes under the current working directory. Use `/search [text]` to find messages and saved tool output on the active conversation branch, including messages before compaction. Press `Enter` on a result to jump to its transcript line or show a context preview. In a plain terminal, pass the query as `/search <text>`.
+
+Use `--max-turns <N>` to set the agent turn limit for each run. The default is 64. This also works with `--print`, JSONL, and RPC.
+
 ### Windows
 
 从 `dist/windows` 选择 `x64` 或 `arm64`，复制完整目录到 Windows，再从该目录运行 `.\ni.exe`。重新编译和打包见 [Windows 使用与打包说明](docs/windows.md)。
@@ -44,7 +50,7 @@ Choose **Reload config** in Herdr (default `Ctrl+B`, then `Shift+R`). Press `Ctr
 
 - **Providers.** OpenAI Chat Completions and Responses, Anthropic Messages, Google Gemini, and OpenAI-compatible endpoints such as DeepSeek, Kimi, OpenRouter, Ollama, and vLLM. The provider adapters preserve supported thinking signatures across turns.
 - **Terminal interface.** Stream Markdown, tables, code, and diffs. Edit multiline input with UTF-8 and CJK support, prompt history, command completion, and `@file` completion. During a reply, `Enter` queues a steering message, and `Alt+Enter` (`Ctrl+Q` on Windows) queues a follow-up. Configure the follow-up shortcut with `app.message.followUp` in `~/.pi/agent/keybindings.json`. `Esc` interrupts a model reply and keeps the draft.
-- **Local commands and copying.** Type `!command` to run a local command and add its output to context, or use `!!command` to keep it local. On macOS and Linux, local commands load interactive aliases when Bash or Zsh is selected and the sandbox is off. In fullscreen, drag across the visible transcript or draft and release to copy the selection.
+- **Local commands and copying.** Type `!command` to run a local command with live output and add its result to context, or use `!!command` to keep it local. On macOS and Linux, local commands load interactive aliases when Bash or Zsh is selected and the sandbox is off. In fullscreen, drag across the visible transcript or draft and release to copy the selection.
 - **Workspace tools.** Read, write, edit, run shell commands, search and list files, ask questions, and discover deferred tools. Fuzzy edits preserve the original BOM and line endings. Use `/copy` to copy a reply, code block, or diff.
 - **Configuration.** Reuse Pi settings, models, credentials, project trust, skills, and prompt templates. Ni supports stdio and Streamable HTTP MCP servers and manages them with `ni mcp list`, `add`, and `remove`.
 

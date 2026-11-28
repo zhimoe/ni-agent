@@ -56,7 +56,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
-            if prompt in ("Record the seed", "Recall the seed", "Finish on turn 64",
+            if prompt in ("Record the seed", "Recall the seed", "Finish on turn 64", "Finish on turn 2",
                           "Use tools forever", "Truncated tool call"):
                 result_count = sum(m.get("role") == "tool" for m in msgs)
                 call = {"index": 0, "id": f"call_{result_count}", "type": "function",
@@ -68,7 +68,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     choice = {"delta": {"content": answer}, "finish_reason": "stop"}
                 elif prompt == "Truncated tool call":
                     choice = {"delta": {"content": "Partial reply", "tool_calls": [call]}, "finish_reason": "length"}
-                elif prompt == "Finish on turn 64" and result_count == 63:
+                elif (prompt, result_count) in (("Finish on turn 64", 63), ("Finish on turn 2", 1)):
                     choice = {"delta": {"content": "Completed at the limit"}, "finish_reason": "stop"}
                 else:
                     choice = {"delta": {"tool_calls": [call]}, "finish_reason": "tool_calls"}
@@ -213,7 +213,10 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
         (@["--mode"], "Missing value for --mode"),
         (@["--security", "--no-tools"], "Missing value for --security"),
         (@["--model"], "Missing value for --model"),
-        (@["--session-id", "a/../bad"], "--session-id expects")
+        (@["--session-id", "a/../bad"], "--session-id expects"),
+        (@["--max-turns", "0"], "--max-turns expects a positive integer"),
+        (@["--max-turns", "many"], "--max-turns expects a positive integer"),
+        (@["--max-turns"], "Missing value for --max-turns")
       ]:
         let (outp, code) = execInWorkspace(cli & " " & quoteShellCommand(@["-p", "Record the seed"] & invalid))
         check code == 1
@@ -328,6 +331,17 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
       let (limitOut, limitCode) = execInWorkspace(cli & " --mode json --no-session " & quoteShell("Use tools forever"))
       check limitCode == 3
       check "\"turns\":64,\"stopReason\":\"turnLimit\",\"exitCode\":3" in limitOut
+      let (customOut, customCode) = execInWorkspace(cli & " --mode json --max-turns 2 --no-session " & quoteShell("Use tools forever"))
+      check customCode == 3
+      check "\"turns\":2,\"stopReason\":\"turnLimit\",\"exitCode\":3" in customOut
+      check "Agent reached the limit of 2 turns" in customOut
+      let (rpcLimit, rpcCode) = execCmdEx(cli & " --mode rpc --max-turns 1 --no-session", workingDir = ws,
+        input = $(%*{"type": "prompt", "message": "Use tools forever"}) & "\n")
+      check rpcCode == 0
+      check "\"turns\":1,\"stopReason\":\"turnLimit\",\"exitCode\":3" in rpcLimit
+      let (customFinished, customFinishedCode) = execInWorkspace(cli & " -p --max-turns 2 --no-session " & quoteShell("Finish on turn 2"))
+      check customFinishedCode == 0
+      check customFinished.strip() == "Completed at the limit"
       let (atLimitOut, atLimitCode) = execInWorkspace(cli & " -p --no-session " & quoteShell("Finish on turn 64"))
       check atLimitCode == 0
       check atLimitOut.strip() == "Completed at the limit"
