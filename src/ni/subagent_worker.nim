@@ -1,13 +1,26 @@
 # Private child entry point. One request per process and no project startup hooks.
 
 import std/[json, jsonutils, monotimes, options, os, times]
+when defined(windows):
+  import std/winlean
+else:
+  import std/posix
 import ./[agent, config, provider, session, subagents, tools, trust, types, utf8]
 
 proc watchParent() {.thread.} =
-  # No more input is expected. The parent keeps this pipe open for its lifetime.
-  var discarded: string
-  while stdin.readLine(discarded): discard
-  quit(130)
+  # Read the pipe directly. A blocking stdio read can hold its stream lock
+  # while the worker's main thread is flushing streams during process exit.
+  var byte: char
+  when defined(windows):
+    let input = getStdHandle(STD_INPUT_HANDLE)
+    var count: int32
+    while readFile(input, addr byte, 1, addr count, nil) != 0 and count > 0: discard
+    discard terminateProcess(getCurrentProcess(), 130)
+  else:
+    while true:
+      let count = posix.read(STDIN_FILENO, addr byte, 1)
+      if count <= 0 and (count == 0 or osLastError() != OSErrorCode(EINTR)): break
+    exitnow(130)
 
 proc sendFrame(frame: JsonNode) =
   stdout.writeLine(encodeJsonUtf8(frame))
