@@ -1,1 +1,1 @@
-const NiVersion* = "0.5.0"
+const NiVersion* = "0.6.0"
